@@ -24,4 +24,7 @@ const (
 
 	// Antigravity represents the Antigravity response format identifier.
 	Antigravity = "antigravity"
+
+	// Junie represents the JetBrains Junie/Grazie provider identifier.
+	Junie = "junie"
 )

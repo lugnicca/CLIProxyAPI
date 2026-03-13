@@ -116,6 +116,9 @@ type Config struct {
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
 
+	// JunieKey defines a list of JetBrains Junie/Grazie JWT token configurations.
+	JunieKey []JunieKey `yaml:"junie-api-key" json:"junie-api-key"`
+
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
@@ -395,6 +398,44 @@ type ClaudeModel struct {
 
 func (m ClaudeModel) GetName() string  { return m.Name }
 func (m ClaudeModel) GetAlias() string { return m.Alias }
+
+// JunieKey represents the configuration for a JetBrains Junie/Grazie JWT token.
+// Unlike other providers, Junie uses JWT tokens instead of API keys or OAuth.
+type JunieKey struct {
+	// APIKey holds the JWT token for authenticating with the JetBrains Grazie API.
+	// Despite the field name, this is a JWT token extracted from the JetBrains IDE.
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Prefix optionally namespaces models for this credential.
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// ProxyURL overrides the global proxy setting for this credential.
+	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []JunieModel `yaml:"models" json:"models"`
+
+	// Headers optionally adds extra HTTP headers for requests.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+}
+
+func (k JunieKey) GetAPIKey() string  { return k.APIKey }
+func (k JunieKey) GetBaseURL() string { return "" }
+
+// JunieModel describes a mapping between an alias and the actual upstream model name.
+type JunieModel struct {
+	Name  string `yaml:"name" json:"name"`
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m JunieModel) GetName() string  { return m.Name }
+func (m JunieModel) GetAlias() string { return m.Alias }
 
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
@@ -856,6 +897,25 @@ func (cfg *Config) SanitizeCodexKeys() {
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
+}
+
+// SanitizeJunieKeys normalizes Junie JWT credentials.
+func (cfg *Config) SanitizeJunieKeys() {
+	if cfg == nil || len(cfg.JunieKey) == 0 {
+		return
+	}
+	out := make([]JunieKey, 0, len(cfg.JunieKey))
+	for i := range cfg.JunieKey {
+		e := cfg.JunieKey[i]
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.Headers = NormalizeHeaders(e.Headers)
+		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		if strings.TrimSpace(e.APIKey) == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.JunieKey = out
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials.

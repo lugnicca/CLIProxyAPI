@@ -2771,5 +2771,117 @@
       "context_length": 114000,
       "max_completion_tokens": 32768
     }
+  ],
+  "junie": [
+    {
+      "id": "gpt-4o",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "GPT-4o (JetBrains)",
+      "context_length": 128000,
+      "max_completion_tokens": 16384
+    },
+    {
+      "id": "o3",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "O3 (JetBrains)",
+      "context_length": 200000,
+      "max_completion_tokens": 100000
+    },
+    {
+      "id": "o4-mini",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "O4-mini (JetBrains)",
+      "context_length": 200000,
+      "max_completion_tokens": 100000
+    },
+    {
+      "id": "gemini-pro-2.5",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "Gemini Pro 2.5 (JetBrains)",
+      "context_length": 1000000,
+      "max_completion_tokens": 65536
+    },
+    {
+      "id": "gemini-flash-2.5",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "Gemini Flash 2.5 (JetBrains)",
+      "context_length": 1000000,
+      "max_completion_tokens": 65536
+    },
+    {
+      "id": "claude-4-sonnet",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "Claude 4 Sonnet (JetBrains)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000
+    },
+    {
+      "id": "claude-3.7-sonnet",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "Claude 3.7 Sonnet (JetBrains)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000
+    },
+    {
+      "id": "claude-3.5-sonnet",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "Claude 3.5 Sonnet (JetBrains)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    },
+    {
+      "id": "claude-3.5-haiku",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "Claude 3.5 Haiku (JetBrains)",
+      "context_length": 200000,
+      "max_completion_tokens": 8192
+    },
+    {
+      "id": "gpt4.1",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "GPT-4.1 (JetBrains)",
+      "context_length": 1000000,
+      "max_completion_tokens": 32768
+    },
+    {
+      "id": "gpt4.1-mini",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "jetbrains",
+      "type": "junie",
+      "display_name": "GPT-4.1 Mini (JetBrains)",
+      "context_length": 1000000,
+      "max_completion_tokens": 32768
+    }
   ]
 }

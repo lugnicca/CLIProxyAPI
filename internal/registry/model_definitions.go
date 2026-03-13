@@ -21,6 +21,7 @@ type staticModelsJSON struct {
 	IFlow       []*ModelInfo `json:"iflow"`
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
+	Junie       []*ModelInfo `json:"junie"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -88,6 +89,11 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+// GetJunieModels returns the standard Junie (JetBrains) model definitions.
+func GetJunieModels() []*ModelInfo {
+	return cloneModelInfos(getModels().Junie)
+}
+
 // cloneModelInfos returns a shallow copy of the slice with each element deep-cloned.
 func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 	if len(models) == 0 {
@@ -137,6 +143,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetKimiModels()
 	case "antigravity":
 		return GetAntigravityModels()
+	case "junie":
+		return GetJunieModels()
 	default:
 		return nil
 	}
@@ -161,6 +169,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.IFlow,
 		data.Kimi,
 		data.Antigravity,
+		data.Junie,
 	}
 	for _, models := range allModels {
 		for _, m := range models {
