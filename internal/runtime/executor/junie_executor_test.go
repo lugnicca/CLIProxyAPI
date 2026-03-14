@@ -34,7 +34,24 @@ func newJunieAuth(apiKey string) *cliproxyauth.Auth {
 	}
 }
 
-// sseBody returns a well-formed SSE body that the mock Grazie server sends.
+// openAISSEBody returns a well-formed OpenAI SSE body (as Ingrazzio returns).
+func openAISSEBody() string {
+	lines := []string{
+		`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+	}
+	return strings.Join(lines, "\n")
+}
+
+// openAIJSONBody returns a well-formed OpenAI non-streaming response (as Ingrazzio returns).
+func openAIJSONBody() string {
+	return `{"id":"chatcmpl-123","object":"chat.completion","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hello world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
+}
+
+// sseBody kept for backward compatibility with old SSE-parsing utility tests below.
 func sseBody() string {
 	lines := []string{
 		`data: {"type":"Content","content":"Hello"}`,
@@ -117,6 +134,9 @@ func TestJunieExecutor_PrepareRequest_SetsJWTHeader(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != grazieUserAgent {
 		t.Fatalf("User-Agent = %q, want %q", got, grazieUserAgent)
 	}
+	if got := req.Header.Get("Grazie-Agent"); got != grazieAgentHeader {
+		t.Fatalf("Grazie-Agent = %q, want %q", got, grazieAgentHeader)
+	}
 }
 
 func TestJunieExecutor_PrepareRequest_FallbackToMetadata(t *testing.T) {
@@ -134,6 +154,10 @@ func TestJunieExecutor_PrepareRequest_FallbackToMetadata(t *testing.T) {
 	if got := req.Header.Get("Authorization"); got != "Bearer metadata-jwt" {
 		t.Fatalf("%s = %q, want %q", "Authorization", got, "Bearer metadata-jwt")
 	}
+	// Grazie-Agent must always be set.
+	if got := req.Header.Get("Grazie-Agent"); got != grazieAgentHeader {
+		t.Fatalf("Grazie-Agent = %q, want %q", got, grazieAgentHeader)
+	}
 }
 
 func TestJunieExecutor_PrepareRequest_NoCredentialsNoHeader(t *testing.T) {
@@ -148,9 +172,12 @@ func TestJunieExecutor_PrepareRequest_NoCredentialsNoHeader(t *testing.T) {
 	if got := req.Header.Get("Authorization"); got != "" {
 		t.Fatalf("expected no JWT header, got %q", got)
 	}
-	// User-Agent should always be set regardless.
+	// User-Agent and Grazie-Agent should always be set regardless.
 	if got := req.Header.Get("User-Agent"); got != grazieUserAgent {
 		t.Fatalf("User-Agent = %q, want %q", got, grazieUserAgent)
+	}
+	if got := req.Header.Get("Grazie-Agent"); got != grazieAgentHeader {
+		t.Fatalf("Grazie-Agent = %q, want %q", got, grazieAgentHeader)
 	}
 }
 
@@ -201,41 +228,89 @@ func TestJunieCreds_NilAuth(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Mock Grazie SSE server helpers
+// Mock Ingrazzio server helpers
 // ---------------------------------------------------------------------------
 
-// newMockGrazieServer starts an httptest.Server that:
+// newMockIngrazzioServer starts an httptest.Server that:
 //   - Accepts POST requests only.
-//   - Requires the grazie-authenticate-jwt header.
-//   - Optionally verifies the request body contains expected JSON fields.
-//   - Streams back a hard-coded SSE payload.
-func newMockGrazieServer(t *testing.T, wantJWT string) *httptest.Server {
+//   - Requires the Authorization header.
+//   - Verifies the Grazie-Agent header is present.
+//   - Streams back a hard-coded OpenAI SSE payload (or JSON for non-stream).
+func newMockIngrazzioServer(t *testing.T, wantJWT string, streaming bool) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Method check
 		if r.Method != http.MethodPost {
-			t.Errorf("mock Grazie server: expected POST, got %s", r.Method)
+			t.Errorf("mock Ingrazzio server: expected POST, got %s", r.Method)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		// JWT header check
 		if jwt := r.Header.Get("Authorization"); jwt == "" {
-			t.Errorf("mock Grazie server: missing %s header", "Authorization")
+			t.Errorf("mock Ingrazzio server: missing %s header", "Authorization")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		} else if wantJWT != "" && jwt != "Bearer "+wantJWT {
-			t.Errorf("mock Grazie server: JWT = %q, want %q", jwt, wantJWT)
+			t.Errorf("mock Ingrazzio server: JWT = %q, want %q", jwt, wantJWT)
+		}
+
+		// Grazie-Agent check
+		if ga := r.Header.Get("Grazie-Agent"); ga == "" {
+			t.Errorf("mock Ingrazzio server: missing Grazie-Agent header")
 		}
 
 		// Read and lightly validate body
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
-			// If it's a non-empty body, it must be valid JSON and expected
-			// to contain at least one of the Grazie format fields.
 			result := gjson.ParseBytes(body)
 			if !result.IsObject() {
-				t.Errorf("mock Grazie server: request body is not a JSON object: %s", body)
+				t.Errorf("mock Ingrazzio server: request body is not a JSON object: %s", body)
+			}
+		}
+
+		if streaming {
+			// Stream SSE response (OpenAI format)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, openAISSEBody())
+		} else {
+			// Non-streaming JSON response (OpenAI format)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, openAIJSONBody())
+		}
+	}))
+}
+
+// newMockGrazieServer is kept for backward compatibility with HttpRequest tests.
+// It accepts any valid JSON POST with an Authorization header and responds with an SSE body.
+func newMockGrazieServer(t *testing.T, wantJWT string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Method check
+		if r.Method != http.MethodPost {
+			t.Errorf("mock server: expected POST, got %s", r.Method)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// JWT header check
+		if jwt := r.Header.Get("Authorization"); jwt == "" {
+			t.Errorf("mock server: missing %s header", "Authorization")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		} else if wantJWT != "" && jwt != "Bearer "+wantJWT {
+			t.Errorf("mock server: JWT = %q, want %q", jwt, wantJWT)
+		}
+
+		// Read and lightly validate body
+		body, _ := io.ReadAll(r.Body)
+		if len(body) > 0 {
+			result := gjson.ParseBytes(body)
+			if !result.IsObject() {
+				t.Errorf("mock server: request body is not a JSON object: %s", body)
 			}
 		}
 
@@ -243,7 +318,7 @@ func newMockGrazieServer(t *testing.T, wantJWT string) *httptest.Server {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprint(w, sseBody())
+		_, _ = fmt.Fprint(w, openAISSEBody())
 	}))
 }
 
@@ -258,7 +333,7 @@ func TestJunieExecutor_HttpRequest_RoundTrip(t *testing.T) {
 	e := newJunieExecutor()
 	auth := newJunieAuth("test-jwt-token")
 
-	body := []byte(`{"prompt":"hello","profile":"junie","chat":[]}`)
+	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
@@ -275,8 +350,9 @@ func TestJunieExecutor_HttpRequest_RoundTrip(t *testing.T) {
 	}
 
 	data, _ := io.ReadAll(resp.Body)
-	if !bytes.Contains(data, []byte("Content")) {
-		t.Fatalf("response body does not contain expected SSE content: %s", data)
+	// Ingrazzio returns OpenAI SSE format; check for expected content.
+	if !bytes.Contains(data, []byte("chat.completion.chunk")) {
+		t.Fatalf("response body does not contain expected OpenAI SSE content: %s", data)
 	}
 }
 
@@ -316,11 +392,11 @@ func TestJunieExecutor_HttpRequest_NilRequest(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestJunieSSEParsing – unit-test the SSE accumulation logic in isolation
+// TestJunieSSEParsing – unit-test the SSE parsing logic in isolation.
+// These helpers parse the old Grazie SSE format and are kept for reference.
 // ---------------------------------------------------------------------------
 
-// parseSSEContent replicates the SSE parsing loop from Execute so we can test
-// it without needing a real network call.
+// parseSSEContent replicates a simple SSE parsing loop.
 func parseSSEContent(t *testing.T, rawSSE []byte) (content string, quotaAmount string) {
 	t.Helper()
 
@@ -400,7 +476,7 @@ func TestJunieExecutor_Execute_MissingToken(t *testing.T) {
 	auth := &cliproxyauth.Auth{} // no credentials
 
 	_, err := e.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "junie-model",
+		Model:   "gpt-4o",
 		Payload: []byte(`{}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.Format("openai"),
@@ -422,7 +498,7 @@ func TestJunieExecutor_ExecuteStream_MissingToken(t *testing.T) {
 	auth := &cliproxyauth.Auth{} // no credentials
 
 	_, err := e.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "junie-model",
+		Model:   "gpt-4o",
 		Payload: []byte(`{}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.Format("openai"),
@@ -436,23 +512,23 @@ func TestJunieExecutor_ExecuteStream_MissingToken(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestJunieExecutor_Integration_MockGrazieSSE
+// TestJunieExecutor_Integration_MockIngrazzioStream
 //
-// Full end-to-end integration test:
-//   - Spin up a mock Grazie SSE server
+// Full end-to-end integration test for streaming:
+//   - Spin up a mock Ingrazzio server that returns OpenAI SSE format
 //   - Use HttpRequest to hit it (bypassing the hard-coded const endpoint)
-//   - Parse the SSE stream using bufio.Scanner (same as ExecuteStream)
-//   - Verify accumulated content matches expected
+//   - Parse the SSE stream using bufio.Scanner
+//   - Verify content passes through as-is (native OpenAI SSE)
 // ---------------------------------------------------------------------------
 
-func TestJunieExecutor_Integration_MockGrazieSSE(t *testing.T) {
-	server := newMockGrazieServer(t, "integration-jwt")
+func TestJunieExecutor_Integration_MockIngrazzioStream(t *testing.T) {
+	server := newMockIngrazzioServer(t, "integration-jwt", true)
 	defer server.Close()
 
 	e := newJunieExecutor()
 	auth := newJunieAuth("integration-jwt")
 
-	body := []byte(`{"prompt":"test","profile":"junie","chat":[{"role":"user","content":"hello"}]}`)
+	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}],"stream":true}`)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
@@ -471,7 +547,7 @@ func TestJunieExecutor_Integration_MockGrazieSSE(t *testing.T) {
 
 	// Replicate the streaming scan logic from ExecuteStream
 	var accumulated strings.Builder
-	var quotaAmount string
+	var sawDone bool
 
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
@@ -480,16 +556,16 @@ func TestJunieExecutor_Integration_MockGrazieSSE(t *testing.T) {
 			continue
 		}
 		payload := bytes.TrimSpace(line[5:])
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			sawDone = true
+			continue
+		}
 		if len(payload) == 0 {
 			continue
 		}
-		eventType := gjson.GetBytes(payload, "type").String()
-		switch eventType {
-		case "Content":
-			accumulated.WriteString(gjson.GetBytes(payload, "content").String())
-		case "QuotaMetadata":
-			quotaAmount = gjson.GetBytes(payload, "spent.amount").String()
-		}
+		// Extract delta content from OpenAI SSE chunk
+		content := gjson.GetBytes(payload, "choices.0.delta.content").String()
+		accumulated.WriteString(content)
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatalf("scanner error: %v", err)
@@ -498,19 +574,19 @@ func TestJunieExecutor_Integration_MockGrazieSSE(t *testing.T) {
 	if got := accumulated.String(); got != "Hello world" {
 		t.Fatalf("accumulated SSE content = %q, want %q", got, "Hello world")
 	}
-	if quotaAmount != "42" {
-		t.Fatalf("quota amount = %q, want %q", quotaAmount, "42")
+	if !sawDone {
+		t.Fatal("expected to see data: [DONE] in SSE stream")
 	}
-	t.Logf("Integration test passed: content=%q quota=%q", accumulated.String(), quotaAmount)
+	t.Logf("Integration test passed: content=%q", accumulated.String())
 }
 
 // ---------------------------------------------------------------------------
-// TestJunieExecutor_Integration_MockGrazieSSE_ErrorStatus
+// TestJunieExecutor_Integration_MockIngrazzioSSE_ErrorStatus
 // ---------------------------------------------------------------------------
 
-func TestJunieExecutor_Integration_MockGrazieSSE_ErrorStatus(t *testing.T) {
+func TestJunieExecutor_Integration_MockIngrazzioSSE_ErrorStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":"quota exceeded"}`, http.StatusTooManyRequests)
+		http.Error(w, `{"error":{"message":"quota exceeded","type":"insufficient_quota"}}`, http.StatusTooManyRequests)
 	}))
 	defer server.Close()
 
@@ -526,5 +602,25 @@ func TestJunieExecutor_Integration_MockGrazieSSE_ErrorStatus(t *testing.T) {
 
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("expected 429, got %d", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestJunieExecutor_GrazieAgentHeader
+// Verify that the Grazie-Agent header is set correctly in PrepareRequest.
+// ---------------------------------------------------------------------------
+
+func TestJunieExecutor_GrazieAgentHeader(t *testing.T) {
+	e := newJunieExecutor()
+	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	auth := newJunieAuth("my-token")
+
+	if err := e.PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest error: %v", err)
+	}
+
+	got := req.Header.Get("Grazie-Agent")
+	if got != grazieAgentHeader {
+		t.Fatalf("Grazie-Agent = %q, want %q", got, grazieAgentHeader)
 	}
 }

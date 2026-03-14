@@ -15,16 +15,21 @@ import (
 	junieauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/junie"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	grazieStreamEndpoint = "https://ingrazzio-cloud-prod.labs.jb.gg/user/v5/llm/chat/stream/v7"
-	grazieUserAgent      = "ktor-client"
+	// ingrazzioEndpoint is the Ingrazzio pass-through endpoint that accepts native
+	// OpenAI Chat Completions format directly (supports tool calling, streaming, etc.)
+	ingrazzioEndpoint = "https://ingrazzio-cloud-prod.labs.jb.gg/v1/chat/completions"
+	grazieUserAgent   = "ktor-client"
+	// grazieAgentHeader is required by Ingrazzio to identify the Junie CLI client.
+	grazieAgentHeader = `{"name":"junie:cli","version":"888.195"}`
 )
 
 // JunieExecutor is a stateless executor for the Junie (JetBrains Grazie) provider.
+// It acts as a simple pass-through: OpenAI-format requests are forwarded directly
+// to the Ingrazzio proxy endpoint, and responses are returned as-is.
 type JunieExecutor struct {
 	cfg *config.Config
 }
@@ -67,7 +72,7 @@ func junieCreds(a *cliproxyauth.Auth) (jwtToken string) {
 	return ""
 }
 
-// PrepareRequest injects Grazie JWT credentials and User-Agent into the outgoing HTTP request.
+// PrepareRequest injects Junie credentials, Grazie-Agent, and User-Agent into the outgoing HTTP request.
 func (e *JunieExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
 		return nil
@@ -77,6 +82,7 @@ func (e *JunieExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		req.Header.Set("Authorization", "Bearer "+jwtToken)
 	}
 	req.Header.Set("User-Agent", grazieUserAgent)
+	req.Header.Set("Grazie-Agent", grazieAgentHeader)
 	return nil
 }
 
@@ -96,36 +102,29 @@ func (e *JunieExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return client.Do(httpReq)
 }
 
-// Execute performs a non-streaming request to the Grazie API.
-// Grazie always returns an SSE stream; this method accumulates the full stream
-// and returns the translated non-streaming response.
+// Execute performs a non-streaming request to the Ingrazzio proxy.
+// The request body is forwarded as-is (native OpenAI format) and the response
+// is returned directly without translation.
 func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	jwtToken := junieCreds(auth)
 	if strings.TrimSpace(jwtToken) == "" {
 		return resp, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	from := opts.SourceFormat
-	to := sdktranslator.Format("junie")
+	// Pass the payload through as-is — Ingrazzio accepts native OpenAI format.
+	body := req.Payload
 
-	originalPayload := opts.OriginalRequest
-	if len(originalPayload) == 0 {
-		originalPayload = req.Payload
-	}
-
-	// Translate from OpenAI format to Grazie format.
-	body := sdktranslator.TranslateRequest(from, to, req.Model, req.Payload, false)
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, grazieStreamEndpoint, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return resp, fmt.Errorf("junie executor: build request: %w", err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+jwtToken)
 	httpReq.Header.Set("User-Agent", grazieUserAgent)
+	httpReq.Header.Set("Grazie-Agent", grazieAgentHeader)
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:      grazieStreamEndpoint,
+		URL:      ingrazzioEndpoint,
 		Method:   http.MethodPost,
 		Headers:  httpReq.Header.Clone(),
 		Body:     body,
@@ -153,6 +152,7 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 
+	// Ingrazzio returns standard OpenAI JSON — read and return directly.
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -160,66 +160,35 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
-	// Feed each SSE line through the translator. The NonStream translator
-	// accumulates Content chunks and returns the full response on QuotaMetadata.
-	var param any
-	var result string
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			continue
-		}
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, trimmed, &param)
-		if out != "" {
-			result = out
-		}
-	}
-
-	// If the stream didn't contain a QuotaMetadata terminator (unusual), we may
-	// still have accumulated content in the translator param. Build a synthetic
-	// stop so the translator flushes.
-	if result == "" {
-		syntheticStop := []byte(`data: {"type":"QuotaMetadata"}`)
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, syntheticStop, &param)
-		if out != "" {
-			result = out
-		}
-	}
-
-	resp = cliproxyexecutor.Response{Payload: []byte(result), Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
 
-// ExecuteStream performs a streaming request to the Grazie API.
-// It pipes SSE lines from Grazie through the translator and sends them on the returned channel.
+// ExecuteStream performs a streaming request to the Ingrazzio proxy.
+// The request body is forwarded as-is (native OpenAI format) with stream:true,
+// and the SSE response is piped through directly without translation.
 func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	jwtToken := junieCreds(auth)
 	if strings.TrimSpace(jwtToken) == "" {
 		return nil, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	from := opts.SourceFormat
-	to := sdktranslator.Format("junie")
+	// Pass the payload through as-is — Ingrazzio accepts native OpenAI format.
+	body := req.Payload
 
-	originalPayload := opts.OriginalRequest
-	if len(originalPayload) == 0 {
-		originalPayload = req.Payload
-	}
-
-	// Translate from OpenAI format to Grazie format.
-	body := sdktranslator.TranslateRequest(from, to, req.Model, req.Payload, true)
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, grazieStreamEndpoint, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("junie executor: build request: %w", err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+jwtToken)
 	httpReq.Header.Set("User-Agent", grazieUserAgent)
+	httpReq.Header.Set("Grazie-Agent", grazieAgentHeader)
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Cache-Control", "no-cache")
 
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:      grazieStreamEndpoint,
+		URL:      ingrazzioEndpoint,
 		Method:   http.MethodPost,
 		Headers:  httpReq.Header.Clone(),
 		Body:     body,
@@ -245,6 +214,8 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, statusErr{code: httpResp.StatusCode, msg: string(data)}
 	}
 
+	// Ingrazzio returns standard OpenAI SSE format (data: {...} with choices[0].delta).
+	// Pipe lines directly through to the caller without any translation.
 	out := make(chan cliproxyexecutor.StreamChunk, 64)
 	go func() {
 		defer close(out)
@@ -256,14 +227,13 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
-		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, bytes.Clone(line), &param)
-			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+			// Pass each SSE line through directly — standard OpenAI SSE format.
+			if len(line) > 0 {
+				out <- cliproxyexecutor.StreamChunk{Payload: bytes.Clone(line)}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
