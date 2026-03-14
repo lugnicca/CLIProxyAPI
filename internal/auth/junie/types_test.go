@@ -2,10 +2,12 @@ package junie
 
 import (
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
 func TestNewJunieAuth(t *testing.T) {
-	auth := NewJunieAuth()
+	auth := NewJunieAuth(&config.Config{})
 	if auth == nil {
 		t.Fatal("NewJunieAuth() returned nil, expected non-nil *JunieAuth")
 	}

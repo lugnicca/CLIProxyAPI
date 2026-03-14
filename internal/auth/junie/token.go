@@ -1,6 +1,7 @@
 // Package junie provides authentication and token management functionality
-// for JetBrains Junie AI services. It handles JWT token storage, serialization,
-// and retrieval for maintaining authenticated sessions with the Grazie API.
+// for JetBrains Junie AI services. It handles JWT and OAuth token storage,
+// serialization, and retrieval for maintaining authenticated sessions with
+// the Grazie API and JetBrains Account OAuth.
 package junie
 
 import (
@@ -16,18 +17,29 @@ import (
 // Compile-time check that JunieTokenStorage implements the TokenStorage interface.
 var _ baseauth.TokenStorage = (*JunieTokenStorage)(nil)
 
-// JunieTokenStorage stores JWT token information for JetBrains Junie / Grazie API authentication.
-// Unlike OAuth-based providers, Junie tokens are JWT tokens manually extracted from
-// the JetBrains IDE and provided by the user directly.
+// JunieTokenStorage stores token information for JetBrains Junie / Grazie API authentication.
+// It supports both OAuth PKCE tokens (access_token, refresh_token, id_token) obtained via
+// JetBrains Account OAuth flow, and legacy JWT tokens manually extracted from the JetBrains IDE.
 type JunieTokenStorage struct {
-	// JWTToken is the JWT token used for authenticating requests to the Grazie API.
-	JWTToken string `json:"jwt_token"`
+	// AccessToken is the OAuth2 access token for authenticating requests to the Grazie API.
+	AccessToken string `json:"access_token,omitempty"`
+	// RefreshToken is the OAuth2 refresh token used to obtain new access tokens.
+	RefreshToken string `json:"refresh_token,omitempty"`
+	// IDToken is the OpenID Connect ID token containing user identity information.
+	IDToken string `json:"id_token,omitempty"`
+	// JWTToken is the legacy JWT token manually extracted from the JetBrains IDE.
+	// Kept for backward compatibility with manual JWT mode.
+	JWTToken string `json:"jwt_token,omitempty"`
 	// Type indicates the authentication provider type, always "junie" for this storage.
 	Type string `json:"type"`
+	// Email is the JetBrains Account email address associated with this token.
+	Email string `json:"email,omitempty"`
 	// Label is a human-readable identifier for this token (e.g. account name or alias).
-	Label string `json:"label"`
-	// LastRefresh is the timestamp of when this token was last stored or verified.
-	LastRefresh string `json:"last_refresh"`
+	Label string `json:"label,omitempty"`
+	// Expire is the RFC3339 timestamp when the current access token expires.
+	Expire string `json:"expired,omitempty"`
+	// LastRefresh is the RFC3339 timestamp of when the tokens were last refreshed.
+	LastRefresh string `json:"last_refresh,omitempty"`
 
 	// Metadata holds arbitrary key-value pairs injected via hooks.
 	// It is not exported to JSON directly to allow flattening during serialization.

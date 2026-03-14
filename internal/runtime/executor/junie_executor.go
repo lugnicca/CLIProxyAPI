@@ -8,9 +8,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	junieauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/junie"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -37,8 +39,11 @@ func NewJunieExecutor(cfg *config.Config) *JunieExecutor {
 // Identifier returns the provider key.
 func (e *JunieExecutor) Identifier() string { return "junie" }
 
-// junieCreds extracts the JWT token from the auth record.
-// It first checks Attributes["api_key"], then falls back to Metadata["jwt_token"].
+// junieCreds extracts the token from the auth record.
+// Priority order:
+//  1. Attributes["api_key"] - manually supplied JWT or API key
+//  2. Metadata["jwt_token"] - legacy JWT token from stored credentials
+//  3. Metadata["access_token"] - OAuth access token from JetBrains Account flow
 func junieCreds(a *cliproxyauth.Auth) (jwtToken string) {
 	if a == nil {
 		return ""
@@ -50,6 +55,12 @@ func junieCreds(a *cliproxyauth.Auth) (jwtToken string) {
 	}
 	if a.Metadata != nil {
 		if v, ok := a.Metadata["jwt_token"].(string); ok {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				return trimmed
+			}
+		}
+		// OAuth access_token from JetBrains Account PKCE flow
+		if v, ok := a.Metadata["access_token"].(string); ok {
 			if trimmed := strings.TrimSpace(v); trimmed != "" {
 				return trimmed
 			}
@@ -272,9 +283,51 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
-// Refresh is a no-op for Junie: JWT tokens must be manually rotated.
+// Refresh attempts to refresh the Junie auth tokens.
+// For OAuth PKCE mode: uses the refresh_token from auth.Metadata to obtain new tokens.
+// For legacy JWT manual mode (no refresh_token in metadata): returns auth unchanged.
+// Nil auth is returned as-is without error.
 func (e *JunieExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	log.Warnf("junie executor: JWT tokens must be manually refreshed; automatic refresh is not supported")
+	if auth == nil {
+		return nil, nil
+	}
+
+	// Check for OAuth refresh token in metadata
+	var refreshToken string
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["refresh_token"].(string); ok {
+			refreshToken = strings.TrimSpace(v)
+		}
+	}
+
+	if refreshToken == "" {
+		// No refresh token available - legacy JWT manual mode, return as-is
+		log.Warnf("junie executor: no refresh_token in metadata; JWT tokens must be manually refreshed")
+		return auth, nil
+	}
+
+	// OAuth mode: exchange refresh token for new tokens
+	tokenData, err := junieauth.NewJunieAuth(e.cfg).RefreshTokens(ctx, refreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("junie executor: token refresh failed: %w", err)
+	}
+
+	// Update metadata with new token values
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["access_token"] = tokenData.AccessToken
+	if tokenData.RefreshToken != "" {
+		auth.Metadata["refresh_token"] = tokenData.RefreshToken
+	}
+	if tokenData.IDToken != "" {
+		auth.Metadata["id_token"] = tokenData.IDToken
+	}
+	auth.Metadata["expired"] = tokenData.Expire
+	auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+	auth.Metadata["type"] = "junie"
+
+	log.Debugf("junie executor: tokens refreshed successfully")
 	return auth, nil
 }
 
