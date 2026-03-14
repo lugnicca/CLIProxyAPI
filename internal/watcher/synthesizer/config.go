@@ -35,6 +35,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
+	// Junie API Keys
+	out = append(out, s.synthesizeJunieKeys(ctx)...)
 
 	return out, nil
 }
@@ -316,6 +318,47 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, compat.ExcludedModels, "apikey")
+		out = append(out, a)
+	}
+	return out
+}
+
+// synthesizeJunieKeys creates Auth entries for Junie/JetBrains API keys.
+func (s *ConfigSynthesizer) synthesizeJunieKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	out := make([]*coreauth.Auth, 0, len(cfg.JunieKey))
+	for i := range cfg.JunieKey {
+		jk := cfg.JunieKey[i]
+		key := strings.TrimSpace(jk.APIKey)
+		if key == "" {
+			continue
+		}
+		prefix := strings.TrimSpace(jk.Prefix)
+		proxyURL := strings.TrimSpace(jk.ProxyURL)
+		id, token := idGen.Next("junie:apikey", key, "")
+		attrs := map[string]string{
+			"source":  fmt.Sprintf("config:junie[%s]", token),
+			"api_key": key,
+		}
+		if jk.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(jk.Priority)
+		}
+		addConfigHeadersToAttrs(jk.Headers, attrs)
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   "junie",
+			Label:      "junie-apikey",
+			Prefix:     prefix,
+			Status:     coreauth.StatusActive,
+			ProxyURL:   proxyURL,
+			Attributes: attrs,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		ApplyAuthExcludedModelsMeta(a, cfg, jk.ExcludedModels, "apikey")
 		out = append(out, a)
 	}
 	return out

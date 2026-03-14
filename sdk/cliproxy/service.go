@@ -916,6 +916,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "junie":
 		models = registry.GetJunieModels()
+		log.Debugf("junie provider: loaded %d models from registry", len(models))
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
