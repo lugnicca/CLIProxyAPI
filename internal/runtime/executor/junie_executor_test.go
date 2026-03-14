@@ -111,8 +111,8 @@ func TestJunieExecutor_PrepareRequest_SetsJWTHeader(t *testing.T) {
 		t.Fatalf("PrepareRequest error: %v", err)
 	}
 
-	if got := req.Header.Get(grazieJWTHeader); got != "test-jwt-token" {
-		t.Fatalf("%s = %q, want %q", grazieJWTHeader, got, "test-jwt-token")
+	if got := req.Header.Get("Authorization"); got != "Bearer test-jwt-token" {
+		t.Fatalf("%s = %q, want %q", "Authorization", got, "Bearer test-jwt-token")
 	}
 	if got := req.Header.Get("User-Agent"); got != grazieUserAgent {
 		t.Fatalf("User-Agent = %q, want %q", got, grazieUserAgent)
@@ -131,8 +131,8 @@ func TestJunieExecutor_PrepareRequest_FallbackToMetadata(t *testing.T) {
 	if err := e.PrepareRequest(req, auth); err != nil {
 		t.Fatalf("PrepareRequest error: %v", err)
 	}
-	if got := req.Header.Get(grazieJWTHeader); got != "metadata-jwt" {
-		t.Fatalf("%s = %q, want %q", grazieJWTHeader, got, "metadata-jwt")
+	if got := req.Header.Get("Authorization"); got != "Bearer metadata-jwt" {
+		t.Fatalf("%s = %q, want %q", "Authorization", got, "Bearer metadata-jwt")
 	}
 }
 
@@ -145,7 +145,7 @@ func TestJunieExecutor_PrepareRequest_NoCredentialsNoHeader(t *testing.T) {
 		t.Fatalf("PrepareRequest error: %v", err)
 	}
 	// Header should be absent (empty string) when no credentials supplied.
-	if got := req.Header.Get(grazieJWTHeader); got != "" {
+	if got := req.Header.Get("Authorization"); got != "" {
 		t.Fatalf("expected no JWT header, got %q", got)
 	}
 	// User-Agent should always be set regardless.
@@ -174,8 +174,8 @@ func TestJunieCreds_AttributesApiKey(t *testing.T) {
 	}
 	_ = e.PrepareRequest(req, auth)
 	// Attributes.api_key should take priority; whitespace trimmed.
-	if got := req.Header.Get(grazieJWTHeader); got != "trimmed-key" {
-		t.Fatalf("expected trimmed Attributes api_key, got %q", got)
+	if got := req.Header.Get("Authorization"); got != "Bearer trimmed-key" {
+		t.Fatalf("expected Bearer+trimmed Attributes api_key, got %q", got)
 	}
 }
 
@@ -186,8 +186,8 @@ func TestJunieCreds_MetadataFallback(t *testing.T) {
 		Metadata: map[string]any{"jwt_token": "  meta-jwt  "},
 	}
 	_ = e.PrepareRequest(req, auth)
-	if got := req.Header.Get(grazieJWTHeader); got != "meta-jwt" {
-		t.Fatalf("expected trimmed Metadata jwt_token, got %q", got)
+	if got := req.Header.Get("Authorization"); got != "Bearer meta-jwt" {
+		t.Fatalf("expected Bearer+trimmed Metadata jwt_token, got %q", got)
 	}
 }
 
@@ -195,7 +195,7 @@ func TestJunieCreds_NilAuth(t *testing.T) {
 	e := newJunieExecutor()
 	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	_ = e.PrepareRequest(req, nil)
-	if got := req.Header.Get(grazieJWTHeader); got != "" {
+	if got := req.Header.Get("Authorization"); got != "" {
 		t.Fatalf("nil auth should produce no JWT header, got %q", got)
 	}
 }
@@ -220,11 +220,11 @@ func newMockGrazieServer(t *testing.T, wantJWT string) *httptest.Server {
 		}
 
 		// JWT header check
-		if jwt := r.Header.Get(grazieJWTHeader); jwt == "" {
-			t.Errorf("mock Grazie server: missing %s header", grazieJWTHeader)
+		if jwt := r.Header.Get("Authorization"); jwt == "" {
+			t.Errorf("mock Grazie server: missing %s header", "Authorization")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
-		} else if wantJWT != "" && jwt != wantJWT {
+		} else if wantJWT != "" && jwt != "Bearer "+wantJWT {
 			t.Errorf("mock Grazie server: JWT = %q, want %q", jwt, wantJWT)
 		}
 
@@ -283,7 +283,7 @@ func TestJunieExecutor_HttpRequest_RoundTrip(t *testing.T) {
 func TestJunieExecutor_HttpRequest_MissingJWT_NoHeader(t *testing.T) {
 	// Server rejects if no JWT header; executor should propagate the 401 status.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(grazieJWTHeader) == "" {
+		if r.Header.Get("Authorization") == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

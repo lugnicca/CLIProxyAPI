@@ -21,8 +21,7 @@ import (
 )
 
 const (
-	grazieStreamEndpoint = "https://api.jetbrains.ai/user/v5/llm/chat/stream/v7"
-	grazieJWTHeader      = "grazie-authenticate-jwt"
+	grazieStreamEndpoint = "https://ingrazzio-cloud-prod.labs.jb.gg/user/v5/llm/chat/stream/v7"
 	grazieUserAgent      = "ktor-client"
 )
 
@@ -75,8 +74,8 @@ func (e *JunieExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		return nil
 	}
 	jwtToken := junieCreds(auth)
-	if strings.TrimSpace(jwtToken) != "" {
-		req.Header.Set(grazieJWTHeader, jwtToken)
+	if jwtToken != "" {
+		req.Header.Set("Authorization", "Bearer "+jwtToken)
 	}
 	req.Header.Set("User-Agent", grazieUserAgent)
 	return nil
@@ -121,7 +120,7 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, fmt.Errorf("junie executor: build request: %w", err)
 	}
-	httpReq.Header.Set(grazieJWTHeader, jwtToken)
+	httpReq.Header.Set("Authorization", "Bearer "+jwtToken)
 	httpReq.Header.Set("User-Agent", grazieUserAgent)
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -222,7 +221,7 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, fmt.Errorf("junie executor: build request: %w", err)
 	}
-	httpReq.Header.Set(grazieJWTHeader, jwtToken)
+	httpReq.Header.Set("Authorization", "Bearer "+jwtToken)
 	httpReq.Header.Set("User-Agent", grazieUserAgent)
 	httpReq.Header.Set("Content-Type", "application/json")
 
