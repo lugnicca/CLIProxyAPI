@@ -94,7 +94,7 @@ func ConvertJunieResponseToOpenAI(_ context.Context, modelName string, _, _, raw
 
 	switch eventType {
 	case "Content":
-		text := gjson.GetBytes(payload, "text").String()
+		text := gjson.GetBytes(payload, "content").String()
 		chunk := buildContentChunk(p, modelName, text)
 		return []string{"data: " + chunk}
 
@@ -131,7 +131,7 @@ func ConvertJunieResponseToOpenAINonStream(_ context.Context, modelName string, 
 
 	switch eventType {
 	case "Content":
-		p.AccumulatedContent += gjson.GetBytes(payload, "text").String()
+		p.AccumulatedContent += gjson.GetBytes(payload, "content").String()
 		return ""
 
 	case "QuotaMetadata":

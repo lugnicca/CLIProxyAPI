@@ -17,7 +17,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -106,15 +105,16 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	from := sdktranslator.Format("junie")
-	to := opts.SourceFormat
+	from := opts.SourceFormat
+	to := sdktranslator.Format("junie")
 
 	originalPayload := opts.OriginalRequest
 	if len(originalPayload) == 0 {
 		originalPayload = req.Payload
 	}
 
-	body := req.Payload
+	// Translate from OpenAI format to Grazie format.
+	body := sdktranslator.TranslateRequest(from, to, req.Model, req.Payload, false)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, grazieStreamEndpoint, bytes.NewReader(body))
 	if err != nil {
@@ -160,42 +160,34 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
-	// Parse SSE lines from Grazie response.
-	// Accumulate Content chunks and find the final QuotaMetadata event.
-	var contentBuf strings.Builder
-	var quotaLine []byte
-
+	// Feed each SSE line through the translator. The NonStream translator
+	// accumulates Content chunks and returns the full response on QuotaMetadata.
+	var param any
+	var result string
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
-		if !bytes.HasPrefix(line, dataTag) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
 			continue
 		}
-		payload := bytes.TrimSpace(line[5:])
-		if len(payload) == 0 {
-			continue
-		}
-		eventType := gjson.GetBytes(payload, "type").String()
-		switch eventType {
-		case "Content":
-			contentBuf.WriteString(gjson.GetBytes(payload, "content").String())
-		case "QuotaMetadata":
-			quotaLine = payload
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, trimmed, &param)
+		if out != "" {
+			result = out
 		}
 	}
 
-	// Build the raw JSON to pass through the translator.
-	// If we have a QuotaMetadata line, use it as the base; otherwise build a minimal response.
-	var rawJSON []byte
-	if len(quotaLine) > 0 {
-		rawJSON = quotaLine
-	} else {
-		// Synthesise a minimal response so the translator has something to work with.
-		rawJSON = []byte(fmt.Sprintf(`{"type":"Content","content":%q}`, contentBuf.String()))
+	// If the stream didn't contain a QuotaMetadata terminator (unusual), we may
+	// still have accumulated content in the translator param. Build a synthetic
+	// stop so the translator flushes.
+	if result == "" {
+		syntheticStop := []byte(`data: {"type":"QuotaMetadata"}`)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, syntheticStop, &param)
+		if out != "" {
+			result = out
+		}
 	}
 
-	var param any
-	out := sdktranslator.TranslateNonStream(ctx, from, to, req.Model, originalPayload, body, rawJSON, &param)
-	resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: []byte(result), Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
 
@@ -207,15 +199,16 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	from := sdktranslator.Format("junie")
-	to := opts.SourceFormat
+	from := opts.SourceFormat
+	to := sdktranslator.Format("junie")
 
 	originalPayload := opts.OriginalRequest
 	if len(originalPayload) == 0 {
 		originalPayload = req.Payload
 	}
 
-	body := req.Payload
+	// Translate from OpenAI format to Grazie format.
+	body := sdktranslator.TranslateRequest(from, to, req.Model, req.Payload, true)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, grazieStreamEndpoint, bytes.NewReader(body))
 	if err != nil {
@@ -268,7 +261,7 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
 
-			chunks := sdktranslator.TranslateStream(ctx, from, to, req.Model, originalPayload, body, bytes.Clone(line), &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, bytes.Clone(line), &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
