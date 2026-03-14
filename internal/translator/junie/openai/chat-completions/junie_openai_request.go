@@ -53,10 +53,10 @@ var modelToGrazieProfile = map[string]string{
 	"gemini-3.1-flash-lite": "google-gemini-3-1-flash-lite",
 	"gemini-3.1-pro":        "google-gemini-3-1-pro",
 	// xAI models
-	"grok-4":                    "xai-grok-4",
-	"grok-4-fast":               "xai-grok-4-fast",
-	"grok-code-fast-1":          "xai-grok-code-fast-1",
-	"grok-4.1-fast":             "xai-grok-4-1-fast",
+	"grok-4":                      "xai-grok-4",
+	"grok-4-fast":                 "xai-grok-4-fast",
+	"grok-code-fast-1":            "xai-grok-code-fast-1",
+	"grok-4.1-fast":               "xai-grok-4-1-fast",
 	"grok-4.1-fast-non-reasoning": "xai-grok-4-1-fast-non-reasoning",
 }
 
@@ -68,9 +68,37 @@ func roleToGrazieType(role string) string {
 	case "assistant":
 		return "assistant_message"
 	default:
-		// user, tool, function — default to user_message
+		// user — default to user_message
 		return "user_message"
 	}
+}
+
+// grazieToolCall represents a single tool call in Grazie assistant_message format.
+type grazieToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// grazieAssistantMessage represents an assistant message in Grazie format, optionally
+// with tool calls.
+type grazieAssistantMessage struct {
+	Type      string           `json:"type"`
+	Content   string           `json:"content"`
+	ToolCalls []grazieToolCall `json:"tool_calls,omitempty"`
+}
+
+// grazieToolResultMessage represents a tool result message in Grazie format.
+type grazieToolResultMessage struct {
+	Type       string `json:"type"`
+	ToolCallID string `json:"tool_call_id"`
+	Content    string `json:"content"`
+}
+
+// grazieMessage is used for regular (non-tool, non-assistant-with-toolcalls) messages.
+type grazieMessage struct {
+	Type    string `json:"type"`
+	Content string `json:"content"`
 }
 
 // ConvertOpenAIRequestToJunie converts an OpenAI Chat Completions request body to
@@ -85,12 +113,13 @@ func roleToGrazieType(role string) string {
 //	    "messages": [
 //	      {"type": "system_message", "content": "..."},
 //	      {"type": "user_message",   "content": "..."}
-//	    ]
+//	    ],
+//	    "tools": [
+//	      {"name": "...", "description": "...", "parameters": {...}}
+//	    ],
+//	    "tool_choice": "auto"
 //	  }
 //	}
-//
-// Tool calls and function messages are not natively supported by Grazie; they are
-// serialised to JSON and embedded as user_message content (known limitation).
 func ConvertOpenAIRequestToJunie(modelName string, inputRawJSON []byte, _ bool) []byte {
 	// Resolve Grazie profile from model name; fall back to the model name itself.
 	profile, ok := modelToGrazieProfile[modelName]
@@ -110,33 +139,48 @@ func ConvertOpenAIRequestToJunie(modelName string, inputRawJSON []byte, _ bool) 
 		return out
 	}
 
-	type grazieMessage struct {
-		Type    string `json:"type"`
-		Content string `json:"content"`
-	}
-
-	var grazieMessages []grazieMessage
+	// Use a slice of json.RawMessage so we can mix differently-shaped message structs.
+	var grazieMessages []json.RawMessage
 
 	for _, msg := range messagesResult.Array() {
 		role := msg.Get("role").String()
 
-		// Handle tool/function messages — embed as JSON string content.
+		// Handle tool result messages — convert to Grazie tool_result format.
 		if role == "tool" || role == "function" {
-			raw := msg.Raw
-			grazieMessages = append(grazieMessages, grazieMessage{
-				Type:    "user_message",
-				Content: raw,
-			})
+			toolMsg := grazieToolResultMessage{
+				Type:       "tool_result",
+				ToolCallID: msg.Get("tool_call_id").String(),
+				Content:    msg.Get("content").String(),
+			}
+			b, err := json.Marshal(toolMsg)
+			if err != nil {
+				continue
+			}
+			grazieMessages = append(grazieMessages, json.RawMessage(b))
 			continue
 		}
 
-		// Handle assistant messages that carry tool_calls — embed as JSON string content.
+		// Handle assistant messages that carry tool_calls — convert to Grazie format
+		// with a proper tool_calls array.
 		if role == "assistant" && msg.Get("tool_calls").Exists() {
-			raw := msg.Raw
-			grazieMessages = append(grazieMessages, grazieMessage{
-				Type:    "assistant_message",
-				Content: raw,
-			})
+			var toolCalls []grazieToolCall
+			for _, tc := range msg.Get("tool_calls").Array() {
+				toolCalls = append(toolCalls, grazieToolCall{
+					ID:        tc.Get("id").String(),
+					Name:      tc.Get("function.name").String(),
+					Arguments: tc.Get("function.arguments").String(),
+				})
+			}
+			assistantMsg := grazieAssistantMessage{
+				Type:      "assistant_message",
+				Content:   msg.Get("content").String(),
+				ToolCalls: toolCalls,
+			}
+			b, err := json.Marshal(assistantMsg)
+			if err != nil {
+				continue
+			}
+			grazieMessages = append(grazieMessages, json.RawMessage(b))
 			continue
 		}
 
@@ -154,10 +198,15 @@ func ConvertOpenAIRequestToJunie(modelName string, inputRawJSON []byte, _ bool) 
 			content = contentResult.String()
 		}
 
-		grazieMessages = append(grazieMessages, grazieMessage{
+		plainMsg := grazieMessage{
 			Type:    roleToGrazieType(role),
 			Content: content,
-		})
+		}
+		b, err := json.Marshal(plainMsg)
+		if err != nil {
+			continue
+		}
+		grazieMessages = append(grazieMessages, json.RawMessage(b))
 	}
 
 	// Serialise the messages via encoding/json so that special characters are escaped correctly.
@@ -169,5 +218,41 @@ func ConvertOpenAIRequestToJunie(modelName string, inputRawJSON []byte, _ bool) 
 
 	// sjson.SetRawBytes lets us embed the already-serialised JSON array verbatim.
 	out, _ = sjson.SetRawBytes(out, "chat.messages", msgBytes)
+
+	// Convert tools array: unwrap the "function" wrapper from each OpenAI tool.
+	toolsResult := gjson.GetBytes(inputRawJSON, "tools")
+	if toolsResult.Exists() && toolsResult.IsArray() {
+		type grazieTool struct {
+			Name        string          `json:"name"`
+			Description string          `json:"description"`
+			Parameters  json.RawMessage `json:"parameters"`
+		}
+		var grazieTools []grazieTool
+		for _, tool := range toolsResult.Array() {
+			fn := tool.Get("function")
+			if !fn.Exists() {
+				continue
+			}
+			gt := grazieTool{
+				Name:        fn.Get("name").String(),
+				Description: fn.Get("description").String(),
+				Parameters:  json.RawMessage(fn.Get("parameters").Raw),
+			}
+			grazieTools = append(grazieTools, gt)
+		}
+		if len(grazieTools) > 0 {
+			toolsBytes, err := json.Marshal(grazieTools)
+			if err == nil {
+				out, _ = sjson.SetRawBytes(out, "chat.tools", toolsBytes)
+			}
+		}
+	}
+
+	// Pass tool_choice through if present.
+	toolChoiceResult := gjson.GetBytes(inputRawJSON, "tool_choice")
+	if toolChoiceResult.Exists() {
+		out, _ = sjson.SetRawBytes(out, "chat.tool_choice", []byte(toolChoiceResult.Raw))
+	}
+
 	return out
 }
