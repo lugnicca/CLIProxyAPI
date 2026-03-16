@@ -34,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/gemini"
+	juniehandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/junie"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/openai"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -342,6 +343,17 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+	}
+
+	// Junie (JetBrains AI) Anthropic-compatible API routes
+	// These routes forward Anthropic Messages-format requests directly to
+	// the Ingrazzio Anthropic endpoint using the JetBrains OAuth token.
+	junieMsgHandler := juniehandlers.NewJunieMessagesHandler()
+	junieV1 := s.engine.Group("/junie/v1")
+	junieV1.Use(AuthMiddleware(s.accessManager))
+	{
+		junieV1.POST("/messages", junieMsgHandler.Messages)
+		junieV1.GET("/models", junieMsgHandler.Models)
 	}
 
 	// Gemini compatible API routes
