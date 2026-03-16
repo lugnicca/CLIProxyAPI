@@ -10,12 +10,14 @@ import (
 	"strings"
 	"time"
 
+	junieauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/junie"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	junieauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/junie"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -26,6 +28,46 @@ const (
 	// grazieAgentHeader is required by Ingrazzio to identify the Junie CLI client.
 	grazieAgentHeader = `{"name":"junie:cli","version":"888.195"}`
 )
+
+// junieModelMapping translates the client-facing model names exposed by CLIProxyAPI
+// to the real provider model names that Ingrazzio accepts.
+// Only entries that differ from the client name are included; everything else
+// passes through unchanged (mapJunieModelName returns the input as-is).
+var junieModelMapping = map[string]string{
+	// OpenAI models
+	"gpt4.1":      "gpt-4.1-2025-04-14",
+	"gpt4.1-mini": "gpt-4.1-mini-2025-04-14",
+	"gpt4.1-nano": "gpt-4.1-nano-2025-04-14",
+	"gpt-5":       "gpt-5-2025-08-07",
+	"gpt-5-mini":  "gpt-5-mini-2025-08-07",
+	"gpt-5-nano":  "gpt-5-nano-2025-08-07",
+
+	// Anthropic models
+	"claude-4-sonnet":   "claude-sonnet-4-20250514",
+	"claude-4.1-opus":   "claude-opus-4-1-20250805",
+	"claude-4.5-sonnet": "claude-sonnet-4-5-20250929",
+	"claude-4.5-haiku":  "claude-haiku-4-5-20251001",
+	"claude-4.5-opus":   "claude-opus-4-5-20251101",
+	"claude-4.6-sonnet": "claude-sonnet-4-6",
+	"claude-4.6-opus":   "claude-opus-4-6",
+
+	// Google models
+	"gemini-flash-2.0":      "gemini-2.0-flash",
+	"gemini-flash-lite-2.0": "gemini-2.0-flash-lite",
+	"gemini-pro-2.5":        "gemini-2.5-pro",
+	"gemini-flash-2.5":      "gemini-2.5-flash",
+	"gemini-flash-lite-2.5": "gemini-2.5-flash-lite",
+}
+
+// mapJunieModelName returns the Ingrazzio-accepted model name for the given
+// client-facing model name. If the name is not in the mapping it is returned
+// unchanged, which handles pass-through names (gpt-4o, o3, grok-4, etc.).
+func mapJunieModelName(clientModel string) string {
+	if mapped, ok := junieModelMapping[clientModel]; ok {
+		return mapped
+	}
+	return clientModel
+}
 
 // JunieExecutor is a stateless executor for the Junie (JetBrains Grazie) provider.
 // It acts as a simple pass-through: OpenAI-format requests are forwarded directly
@@ -111,8 +153,18 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	// Pass the payload through as-is — Ingrazzio accepts native OpenAI format.
+	// Translate the client-facing model name to the Ingrazzio-accepted name.
 	body := req.Payload
+	if clientModel := gjson.GetBytes(body, "model").String(); clientModel != "" {
+		mapped := mapJunieModelName(clientModel)
+		if mapped != clientModel {
+			var setErr error
+			body, setErr = sjson.SetBytes(body, "model", mapped)
+			if setErr != nil {
+				return resp, fmt.Errorf("junie executor: rewrite model name: %w", setErr)
+			}
+		}
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
 	if err != nil {
@@ -173,8 +225,18 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	// Pass the payload through as-is — Ingrazzio accepts native OpenAI format.
+	// Translate the client-facing model name to the Ingrazzio-accepted name.
 	body := req.Payload
+	if clientModel := gjson.GetBytes(body, "model").String(); clientModel != "" {
+		mapped := mapJunieModelName(clientModel)
+		if mapped != clientModel {
+			var setErr error
+			body, setErr = sjson.SetBytes(body, "model", mapped)
+			if setErr != nil {
+				return nil, fmt.Errorf("junie executor: rewrite model name: %w", setErr)
+			}
+		}
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
 	if err != nil {
