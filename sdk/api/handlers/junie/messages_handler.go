@@ -239,6 +239,7 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 	// Translate Anthropic request → OpenAI request (with stream=true)
 	openaiBody := anthropicToOpenAIRequest(anthropicBody, model)
 	openaiBody, _ = sjson.SetBytes(openaiBody, "stream", true)
+	openaiBody, _ = sjson.SetBytes(openaiBody, "stream_options", map[string]any{"include_usage": true})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioOpenAIChatURL, bytes.NewReader(openaiBody))
 	if err != nil {
@@ -382,6 +383,12 @@ func anthropicToOpenAIRequest(body []byte, model string) []byte {
 	}
 	if topP := gjson.GetBytes(body, "top_p"); topP.Exists() {
 		result["top_p"] = topP.Float()
+	}
+
+	// OpenAI requires stream_options when streaming
+	if stream := gjson.GetBytes(body, "stream"); stream.Exists() && stream.Bool() {
+		result["stream"] = true
+		result["stream_options"] = map[string]any{"include_usage": true}
 	}
 
 	// Convert tools if present
