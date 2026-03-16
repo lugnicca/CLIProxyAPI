@@ -128,6 +128,15 @@ func (h *JunieMessagesHandler) Messages(c *gin.Context) {
 	model := mapModel(gjson.GetBytes(rawJSON, "model").String())
 	isStream := gjson.GetBytes(rawJSON, "stream").Bool()
 
+	// Debug: log non-Claude requests
+	if !isClaudeModel(model) {
+		log.Infof("junie handler: model=%s stream=%v tools=%d msg_count=%d max_tokens=%s",
+			model, isStream,
+			len(gjson.GetBytes(rawJSON, "tools").Array()),
+			len(gjson.GetBytes(rawJSON, "messages").Array()),
+			gjson.GetBytes(rawJSON, "max_tokens").Raw)
+	}
+
 	if isClaudeModel(model) {
 		// Claude → pass-through to Ingrazzio Anthropic endpoint
 		if isStream {
@@ -250,6 +259,8 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 	openaiBody, _ = sjson.SetBytes(openaiBody, "stream", true)
 	openaiBody, _ = sjson.SetBytes(openaiBody, "stream_options", map[string]any{"include_usage": true})
 
+	log.Infof("junie handler: translated OpenAI request (first 500): %s", truncate(string(openaiBody), 500))
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioOpenAIChatURL, bytes.NewReader(openaiBody))
 	if err != nil {
 		apiError(c, http.StatusInternalServerError, err.Error())
@@ -295,11 +306,12 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 		flush()
 	}
 
-	// Send Anthropic message_start event
+	// Send Anthropic message_start event — match Anthropic's exact field order and structure.
+	// Claude Code parses this strictly; field order and usage shape must match.
 	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	writeEvent("message_start", fmt.Sprintf(
-		`{"type":"message_start","message":{"id":%q,"type":"message","role":"assistant","content":[],"model":%q,"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`,
-		msgID, model))
+		`{"type":"message_start","message":{"model":%q,"id":%q,"type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}`,
+		model, msgID))
 
 	// Send content_block_start
 	writeEvent("content_block_start",
@@ -335,8 +347,8 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 
 	// Send content_block_stop
 	writeEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
-	// Send message_delta with stop_reason
-	writeEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}`)
+	// Send message_delta with stop_reason — match Anthropic's exact format
+	writeEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}`)
 	// Send message_stop
 	writeEvent("message_stop", `{"type":"message_stop"}`)
 	flush()
@@ -561,6 +573,13 @@ func setOpenAIHeaders(req *http.Request, token string) {
 	req.Header.Set("User-Agent", grazieUserAgent)
 	req.Header.Set("Grazie-Agent", grazieAgentHeader)
 	req.Header.Set("Content-Type", "application/json")
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func forwardResponseHeaders(c *gin.Context, resp *http.Response) {
