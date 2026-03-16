@@ -260,6 +260,8 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 	openaiBody, _ = sjson.SetBytes(openaiBody, "stream_options", map[string]any{"include_usage": true})
 
 	log.Infof("junie handler: translated OpenAI request (first 500): %s", truncate(string(openaiBody), 500))
+	// Debug: dump full translated request to file
+	_ = os.WriteFile("/tmp/junie_debug_request.json", openaiBody, 0644)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioOpenAIChatURL, bytes.NewReader(openaiBody))
 	if err != nil {
@@ -301,9 +303,15 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 		}
 	}
 
+	// Debug: log all SSE events to file
+	debugFile, _ := os.OpenFile("/tmp/junie_debug_sse.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	writeEvent := func(event, data string) {
-		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, data)
+		line := fmt.Sprintf("event: %s\ndata: %s\n\n", event, data)
+		fmt.Fprint(c.Writer, line)
 		flush()
+		if debugFile != nil {
+			fmt.Fprint(debugFile, line)
+		}
 	}
 
 	// Send Anthropic message_start event — match Anthropic's exact field order and structure.
@@ -317,10 +325,27 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 	writeEvent("content_block_start",
 		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
 
+	// Debug: also log raw OpenAI SSE
+	rawSSEFile, _ := os.OpenFile("/tmp/junie_debug_openai_sse.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+
+	// Track tool calls being assembled across chunks
+	type toolCallState struct {
+		id        string
+		name      string
+		arguments string
+	}
+	var toolCalls []toolCallState
+	contentBlockIdx := 0
+	hasTextContent := false
+	stopReason := "end_turn"
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(nil, 52_428_800)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if rawSSEFile != nil {
+			fmt.Fprintln(rawSSEFile, line)
+		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -329,26 +354,82 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 			break
 		}
 
-		// Extract content delta from OpenAI chunk
-		delta := gjson.Get(payload, "choices.0.delta.content")
+		choice := gjson.Get(payload, "choices.0")
+
+		// Handle text content delta
+		delta := choice.Get("delta.content")
 		if delta.Exists() && delta.String() != "" {
-			// Use the raw JSON string value to preserve escaping
+			if !hasTextContent {
+				hasTextContent = true
+			}
 			writeEvent("content_block_delta", fmt.Sprintf(
-				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`,
-				delta.Raw))
+				`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`,
+				contentBlockIdx, delta.Raw))
+		}
+
+		// Handle tool call chunks
+		tcDelta := choice.Get("delta.tool_calls")
+		if tcDelta.Exists() && tcDelta.IsArray() {
+			tcDelta.ForEach(func(_, tc gjson.Result) bool {
+				idx := int(tc.Get("index").Int())
+				// Grow tool call slice as needed
+				for len(toolCalls) <= idx {
+					toolCalls = append(toolCalls, toolCallState{})
+				}
+				if id := tc.Get("id").String(); id != "" {
+					toolCalls[idx].id = id
+				}
+				if name := tc.Get("function.name").String(); name != "" {
+					toolCalls[idx].name = name
+				}
+				if args := tc.Get("function.arguments").String(); args != "" {
+					toolCalls[idx].arguments += args
+				}
+				return true
+			})
 		}
 
 		// Check for finish
-		finishReason := gjson.Get(payload, "choices.0.finish_reason")
-		if finishReason.Exists() && finishReason.String() != "" && finishReason.Type != gjson.Null {
+		finishReason := choice.Get("finish_reason")
+		if finishReason.Exists() && finishReason.Type != gjson.Null && finishReason.String() != "" {
+			fr := finishReason.String()
+			if fr == "tool_calls" {
+				stopReason = "tool_use"
+			} else if fr == "length" {
+				stopReason = "max_tokens"
+			}
 			break
 		}
 	}
+	if rawSSEFile != nil {
+		rawSSEFile.Close()
+	}
 
-	// Send content_block_stop
-	writeEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
+	// Close text content block
+	writeEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, contentBlockIdx))
+
+	// Emit tool_use content blocks if any
+	if len(toolCalls) > 0 {
+		for _, tc := range toolCalls {
+			contentBlockIdx++
+			// content_block_start for tool_use
+			writeEvent("content_block_start", fmt.Sprintf(
+				`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%q,"name":%q,"input":{}}}`,
+				contentBlockIdx, tc.id, tc.name))
+			// Send arguments as input_json_delta
+			if tc.arguments != "" {
+				writeEvent("content_block_delta", fmt.Sprintf(
+					`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%q}}`,
+					contentBlockIdx, tc.arguments))
+			}
+			writeEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, contentBlockIdx))
+		}
+	}
+
 	// Send message_delta with stop_reason — match Anthropic's exact format
-	writeEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}`)
+	writeEvent("message_delta", fmt.Sprintf(
+		`{"type":"message_delta","delta":{"stop_reason":%q,"stop_sequence":null},"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}`,
+		stopReason))
 	// Send message_stop
 	writeEvent("message_stop", `{"type":"message_stop"}`)
 	flush()
@@ -362,10 +443,24 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 func anthropicToOpenAIRequest(body []byte, model string) []byte {
 	var messages []map[string]any
 
-	// Convert system prompt
+	// Convert system prompt — Anthropic sends it as string or array of content blocks
 	sys := gjson.GetBytes(body, "system")
-	if sys.Exists() && sys.String() != "" {
-		messages = append(messages, map[string]any{"role": "system", "content": sys.String()})
+	if sys.Exists() {
+		if sys.Type == gjson.String {
+			messages = append(messages, map[string]any{"role": "system", "content": sys.String()})
+		} else if sys.IsArray() {
+			// Extract text from content blocks, ignore cache_control etc.
+			var sysText string
+			sys.ForEach(func(_, block gjson.Result) bool {
+				if block.Get("type").String() == "text" {
+					sysText += block.Get("text").String() + "\n"
+				}
+				return true
+			})
+			if sysText != "" {
+				messages = append(messages, map[string]any{"role": "system", "content": strings.TrimSpace(sysText)})
+			}
+		}
 	}
 
 	// Convert messages
