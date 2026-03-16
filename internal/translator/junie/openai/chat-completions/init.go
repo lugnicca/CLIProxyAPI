@@ -8,36 +8,33 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/translator"
 )
 
-// init registers identity (pass-through) translators for the junie provider format.
-//
-// The JunieExecutor now forwards requests to the Ingrazzio proxy endpoint
-// (https://ingrazzio-cloud-prod.labs.jb.gg/v1/chat/completions) which accepts
-// native OpenAI Chat Completions format directly. No request/response translation
-// is needed — the OpenAI payload is forwarded as-is and the OpenAI response is
-// returned as-is.
-//
-// These identity translators ensure that any code path that looks up junie
-// translators in the registry gets the payload unchanged.
+// identityRequest is an identity (pass-through) request translator.
+// The JunieExecutor sends requests directly in OpenAI format to the
+// Ingrazzio /v1/chat/completions endpoint, so no format conversion is needed.
+func identityRequest(_ string, rawJSON []byte, _ bool) []byte {
+	return rawJSON
+}
+
+// identityStream is an identity (pass-through) streaming response translator.
+// Ingrazzio returns native OpenAI SSE format, so no translation is needed.
+func identityStream(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) []string {
+	return []string{string(rawJSON)}
+}
+
+// identityNonStream is an identity (pass-through) non-streaming response translator.
+// Ingrazzio returns native OpenAI JSON format, so no translation is needed.
+func identityNonStream(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) string {
+	return string(rawJSON)
+}
+
 func init() {
 	translator.Register(
 		OpenAI,
 		Junie,
-		// Request: pass through as-is (OpenAI format forwarded directly to Ingrazzio)
-		func(model string, rawJSON []byte, stream bool) []byte {
-			return rawJSON
-		},
+		identityRequest,
 		interfaces.TranslateResponse{
-			// Stream: pass each SSE line through unchanged
-			Stream: func(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) []string {
-				if len(rawJSON) == 0 {
-					return nil
-				}
-				return []string{string(rawJSON)}
-			},
-			// NonStream: pass the full response through unchanged
-			NonStream: func(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) string {
-				return string(rawJSON)
-			},
+			Stream:    identityStream,
+			NonStream: identityNonStream,
 		},
 	)
 }

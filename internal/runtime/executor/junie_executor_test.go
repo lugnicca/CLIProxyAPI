@@ -631,6 +631,7 @@ func TestJunieExecutor_GrazieAgentHeader(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMapJunieModelName_OpenAIRewritten(t *testing.T) {
+	// Models that have a mapping entry (alias -> real provider name for /v1/chat/completions).
 	cases := []struct {
 		input string
 		want  string
@@ -650,7 +651,23 @@ func TestMapJunieModelName_OpenAIRewritten(t *testing.T) {
 	}
 }
 
+func TestMapJunieModelName_OpenAIPassThrough(t *testing.T) {
+	// These OpenAI models pass through unchanged (real names accepted by /v1/chat/completions).
+	passThrough := []string{
+		"gpt-4o", "gpt-4o-mini", "o1", "o3", "o3-mini", "o4-mini",
+		"gpt-5-codex", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini",
+		"gpt-5.1-codex-max", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4",
+	}
+	for _, name := range passThrough {
+		got := mapJunieModelName(name)
+		if got != name {
+			t.Errorf("mapJunieModelName(%q) = %q, want unchanged %q", name, got, name)
+		}
+	}
+}
+
 func TestMapJunieModelName_AnthropicRewritten(t *testing.T) {
+	// Maps alias -> real provider model name for /v1/chat/completions endpoint.
 	cases := []struct {
 		input string
 		want  string
@@ -672,6 +689,7 @@ func TestMapJunieModelName_AnthropicRewritten(t *testing.T) {
 }
 
 func TestMapJunieModelName_GoogleRewritten(t *testing.T) {
+	// Maps alias -> real provider model name for /v1/chat/completions endpoint.
 	cases := []struct {
 		input string
 		want  string
@@ -690,33 +708,38 @@ func TestMapJunieModelName_GoogleRewritten(t *testing.T) {
 	}
 }
 
-func TestMapJunieModelName_PassThrough(t *testing.T) {
-	// These names are passed through unchanged (same client name == Ingrazzio name).
+func TestMapJunieModelName_GooglePassThrough(t *testing.T) {
+	// These Gemini models pass through unchanged.
 	passThrough := []string{
-		"gpt-4o",
-		"gpt-4o-mini",
-		"gpt-5-codex",
-		"gpt-5.1",
-		"gpt-5.1-codex",
-		"gpt-5.1-codex-mini",
-		"gpt-5.1-codex-max",
-		"gpt-5.2",
-		"gpt-5.2-codex",
-		"gpt-5.3-codex",
-		"gpt-5.4",
-		"o1",
-		"o3",
-		"o3-mini",
-		"o4-mini",
-		"gemini-3.0-pro",
-		"gemini-3.0-flash",
-		"gemini-3.1-flash-lite",
-		"gemini-3.1-pro",
-		"grok-4",
-		"grok-4-fast",
-		"grok-code-fast-1",
-		"grok-4.1-fast",
-		"grok-4.1-fast-non-reasoning",
+		"gemini-3.0-pro", "gemini-3.0-flash", "gemini-3.1-flash-lite", "gemini-3.1-pro",
+	}
+	for _, name := range passThrough {
+		got := mapJunieModelName(name)
+		if got != name {
+			t.Errorf("mapJunieModelName(%q) = %q, want unchanged %q", name, got, name)
+		}
+	}
+}
+
+func TestMapJunieModelName_XAIPassThrough(t *testing.T) {
+	// xAI Grok models pass through unchanged (real names accepted by /v1/chat/completions).
+	passThrough := []string{
+		"grok-4", "grok-4-fast", "grok-code-fast-1",
+		"grok-4.1-fast", "grok-4.1-fast-non-reasoning",
+	}
+	for _, name := range passThrough {
+		got := mapJunieModelName(name)
+		if got != name {
+			t.Errorf("mapJunieModelName(%q) = %q, want unchanged %q", name, got, name)
+		}
+	}
+}
+
+func TestMapJunieModelName_PassThrough(t *testing.T) {
+	// These names have no mapping entry and pass through unchanged.
+	passThrough := []string{
+		"some-unknown-model",
+		"future-model-9000",
 	}
 	for _, name := range passThrough {
 		got := mapJunieModelName(name)
@@ -751,11 +774,9 @@ func TestJunieExecutor_Execute_ModelMapping(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Temporarily override the endpoint constant via a thin wrapper — we test
-	// model rewriting by sending directly through a mock Execute that uses a
-	// custom URL. Since the Execute method has the endpoint hard-coded as a
-	// const we verify the mapping logic itself through mapJunieModelName, and
-	// confirm payload mutation via a direct sjson round-trip here.
+	// Verify the mapping logic itself through mapJunieModelName and confirm
+	// payload mutation via a direct sjson round-trip.
+	// gpt4.1 (alias) -> gpt-4.1-2025-04-14 (real provider name for /v1/chat/completions)
 	payload := []byte(`{"model":"gpt4.1","messages":[{"role":"user","content":"hi"}]}`)
 	clientModel := gjson.GetBytes(payload, "model").String()
 	mapped := mapJunieModelName(clientModel)
@@ -769,11 +790,11 @@ func TestJunieExecutor_Execute_ModelMapping(t *testing.T) {
 	if got := gjson.GetBytes(rewritten, "model").String(); got != "gpt-4.1-2025-04-14" {
 		t.Fatalf("rewritten model = %q, want %q", got, "gpt-4.1-2025-04-14")
 	}
-	// Verify pass-through model is not touched.
+	// Verify pass-through model is not touched (gpt-4o is the real provider name).
 	passthroughPayload := []byte(`{"model":"gpt-4o","messages":[]}`)
 	pt := gjson.GetBytes(passthroughPayload, "model").String()
 	if mapJunieModelName(pt) != "gpt-4o" {
-		t.Fatalf("gpt-4o should pass through unchanged")
+		t.Fatalf("gpt-4o should pass through unchanged, got %q", mapJunieModelName(pt))
 	}
 	_ = receivedModel
 	_ = server
@@ -781,6 +802,7 @@ func TestJunieExecutor_Execute_ModelMapping(t *testing.T) {
 
 func TestJunieExecutor_ExecuteStream_ModelMapping(t *testing.T) {
 	// Same logic: verify that payload rewriting works correctly for stream path.
+	// claude-4.6-sonnet (alias) -> claude-sonnet-4-6 (real provider name for /v1/chat/completions)
 	payload := []byte(`{"model":"claude-4.6-sonnet","messages":[{"role":"user","content":"hello"}],"stream":true}`)
 	clientModel := gjson.GetBytes(payload, "model").String()
 	mapped := mapJunieModelName(clientModel)

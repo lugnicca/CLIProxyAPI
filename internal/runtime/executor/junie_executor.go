@@ -15,32 +15,32 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
-	// ingrazzioEndpoint is the Ingrazzio pass-through endpoint that accepts native
-	// OpenAI Chat Completions format directly (supports tool calling, streaming, etc.)
+	// ingrazzioEndpoint is the JetBrains Ingrazzio OpenAI-compatible chat completions endpoint.
+	// It accepts standard OpenAI /v1/chat/completions format and returns OpenAI-format responses.
 	ingrazzioEndpoint = "https://ingrazzio-cloud-prod.labs.jb.gg/v1/chat/completions"
 	grazieUserAgent   = "ktor-client"
 	// grazieAgentHeader is required by Ingrazzio to identify the Junie CLI client.
 	grazieAgentHeader = `{"name":"junie:cli","version":"888.195"}`
 )
 
-// junieModelMapping translates the client-facing model names exposed by CLIProxyAPI
-// to the real provider model names that Ingrazzio accepts.
-// Only entries that differ from the client name are included; everything else
-// passes through unchanged (mapJunieModelName returns the input as-is).
+// junieModelMapping maps client-facing model aliases to the real provider model names
+// accepted by the Ingrazzio /v1/chat/completions endpoint.
+// Derived from mitmproxy traffic captures of the Junie CLI (March 2026).
+// Models not listed here pass through unchanged.
 var junieModelMapping = map[string]string{
-	// OpenAI models
-	"gpt4.1":      "gpt-4.1-2025-04-14",
-	"gpt4.1-mini": "gpt-4.1-mini-2025-04-14",
-	"gpt4.1-nano": "gpt-4.1-nano-2025-04-14",
-	"gpt-5":       "gpt-5-2025-08-07",
-	"gpt-5-mini":  "gpt-5-mini-2025-08-07",
-	"gpt-5-nano":  "gpt-5-nano-2025-08-07",
+	// OpenAI models — client alias -> real provider model name
+	"gpt4.1":              "gpt-4.1-2025-04-14",
+	"gpt4.1-mini":         "gpt-4.1-mini-2025-04-14",
+	"gpt4.1-nano":         "gpt-4.1-nano-2025-04-14",
+	"gpt-5":               "gpt-5-2025-08-07",
+	"gpt-5-mini":          "gpt-5-mini-2025-08-07",
+	"gpt-5-nano":          "gpt-5-nano-2025-08-07",
 
 	// Anthropic models
 	"claude-4-sonnet":   "claude-sonnet-4-20250514",
@@ -51,7 +51,7 @@ var junieModelMapping = map[string]string{
 	"claude-4.6-sonnet": "claude-sonnet-4-6",
 	"claude-4.6-opus":   "claude-opus-4-6",
 
-	// Google models
+	// Google Gemini models
 	"gemini-flash-2.0":      "gemini-2.0-flash",
 	"gemini-flash-lite-2.0": "gemini-2.0-flash-lite",
 	"gemini-pro-2.5":        "gemini-2.5-pro",
@@ -59,9 +59,8 @@ var junieModelMapping = map[string]string{
 	"gemini-flash-lite-2.5": "gemini-2.5-flash-lite",
 }
 
-// mapJunieModelName returns the Ingrazzio-accepted model name for the given
-// client-facing model name. If the name is not in the mapping it is returned
-// unchanged, which handles pass-through names (gpt-4o, o3, grok-4, etc.).
+// mapJunieModelName returns the real provider model name for the given client-facing
+// model alias. If the name is not in the mapping it is returned unchanged.
 func mapJunieModelName(clientModel string) string {
 	if mapped, ok := junieModelMapping[clientModel]; ok {
 		return mapped
@@ -69,9 +68,10 @@ func mapJunieModelName(clientModel string) string {
 	return clientModel
 }
 
-// JunieExecutor is a stateless executor for the Junie (JetBrains Grazie) provider.
-// It acts as a simple pass-through: OpenAI-format requests are forwarded directly
-// to the Ingrazzio proxy endpoint, and responses are returned as-is.
+// JunieExecutor is a stateless executor for the Junie (JetBrains Ingrazzio) provider.
+// Requests are forwarded directly to the Ingrazzio /v1/chat/completions endpoint in
+// OpenAI format — no format translation is needed. Only the model name is mapped from
+// the client-facing alias to the real provider name accepted by the endpoint.
 type JunieExecutor struct {
 	cfg *config.Config
 }
@@ -144,27 +144,35 @@ func (e *JunieExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return client.Do(httpReq)
 }
 
-// Execute performs a non-streaming request to the Ingrazzio proxy.
-// The request body is forwarded as-is (native OpenAI format) and the response
-// is returned directly without translation.
+// mapPayloadModel reads the model field from payload, maps it via mapJunieModelName,
+// and returns the updated payload. If the model is unchanged, the original payload is returned.
+func mapPayloadModel(payload []byte) []byte {
+	clientModel := gjson.GetBytes(payload, "model").String()
+	if clientModel == "" {
+		return payload
+	}
+	mapped := mapJunieModelName(clientModel)
+	if mapped == clientModel {
+		return payload
+	}
+	updated, err := sjson.SetBytes(payload, "model", mapped)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+// Execute performs a non-streaming request to the Ingrazzio /v1/chat/completions endpoint.
+// The request is forwarded as-is (OpenAI format) after model name mapping.
+// The JSON response is returned directly without any translation.
 func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	jwtToken := junieCreds(auth)
 	if strings.TrimSpace(jwtToken) == "" {
 		return resp, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	// Translate the client-facing model name to the Ingrazzio-accepted name.
-	body := req.Payload
-	if clientModel := gjson.GetBytes(body, "model").String(); clientModel != "" {
-		mapped := mapJunieModelName(clientModel)
-		if mapped != clientModel {
-			var setErr error
-			body, setErr = sjson.SetBytes(body, "model", mapped)
-			if setErr != nil {
-				return resp, fmt.Errorf("junie executor: rewrite model name: %w", setErr)
-			}
-		}
-	}
+	// Apply model name mapping to the payload.
+	body := mapPayloadModel(req.Payload)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
 	if err != nil {
@@ -197,46 +205,34 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("junie executor: request error, status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(b)}
-	}
-
-	// Ingrazzio returns standard OpenAI JSON — read and return directly.
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+	data, errRead := io.ReadAll(httpResp.Body)
+	if errRead != nil {
+		recordAPIResponseError(ctx, e.cfg, errRead)
+		return resp, errRead
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		logWithRequestID(ctx).Debugf("junie executor: request error, status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
+	}
+
+	// Return the OpenAI-format JSON response directly — no translation needed.
 	resp = cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
 
-// ExecuteStream performs a streaming request to the Ingrazzio proxy.
-// The request body is forwarded as-is (native OpenAI format) with stream:true,
-// and the SSE response is piped through directly without translation.
+// ExecuteStream performs a streaming request to the Ingrazzio /v1/chat/completions endpoint.
+// SSE lines are piped directly to the output channel — no translation is needed since
+// Ingrazzio returns native OpenAI SSE format.
 func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	jwtToken := junieCreds(auth)
 	if strings.TrimSpace(jwtToken) == "" {
 		return nil, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	// Translate the client-facing model name to the Ingrazzio-accepted name.
-	body := req.Payload
-	if clientModel := gjson.GetBytes(body, "model").String(); clientModel != "" {
-		mapped := mapJunieModelName(clientModel)
-		if mapped != clientModel {
-			var setErr error
-			body, setErr = sjson.SetBytes(body, "model", mapped)
-			if setErr != nil {
-				return nil, fmt.Errorf("junie executor: rewrite model name: %w", setErr)
-			}
-		}
-	}
+	// Apply model name mapping to the payload.
+	body := mapPayloadModel(req.Payload)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
 	if err != nil {
@@ -246,8 +242,6 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	httpReq.Header.Set("User-Agent", grazieUserAgent)
 	httpReq.Header.Set("Grazie-Agent", grazieAgentHeader)
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
 
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
 		URL:      ingrazzioEndpoint,
@@ -276,8 +270,6 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, statusErr{code: httpResp.StatusCode, msg: string(data)}
 	}
 
-	// Ingrazzio returns standard OpenAI SSE format (data: {...} with choices[0].delta).
-	// Pipe lines directly through to the caller without any translation.
 	out := make(chan cliproxyexecutor.StreamChunk, 64)
 	go func() {
 		defer close(out)
@@ -293,8 +285,10 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
 
-			// Pass each SSE line through directly — standard OpenAI SSE format.
-			if len(line) > 0 {
+			// Pass through non-empty SSE lines directly — Ingrazzio returns native
+			// OpenAI SSE format so no translation is required.
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
 				out <- cliproxyexecutor.StreamChunk{Payload: bytes.Clone(line)}
 			}
 		}
