@@ -15,32 +15,84 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	log "github.com/sirupsen/logrus"
 )
+
+// --------------------------------------------------------------------------
+// Ingrazzio backend endpoints (per-provider, native format).
+// Discovered via Junie CLI JAR decompilation (March 2026).
+// --------------------------------------------------------------------------
 
 const (
-	// ingrazzioEndpoint is the JetBrains Ingrazzio OpenAI-compatible chat completions endpoint.
-	// It accepts standard OpenAI /v1/chat/completions format and returns OpenAI-format responses.
-	ingrazzioEndpoint = "https://ingrazzio-cloud-prod.labs.jb.gg/v1/chat/completions"
+	ingrazzioBase = "https://ingrazzio-cloud-prod.labs.jb.gg"
+
+	// OpenAI-format endpoint — accepts only OpenAI models.
+	ingrazzioOpenAIEndpoint = ingrazzioBase + "/user/v5/llm/openai/v1/chat/completions"
+
+	// Anthropic Messages-format endpoint — accepts only Claude models.
+	ingrazzioAnthropicEndpoint = ingrazzioBase + "/user/v5/llm/anthropic/v1/messages"
+
 	grazieUserAgent   = "ktor-client"
-	// grazieAgentHeader is required by Ingrazzio to identify the Junie CLI client.
 	grazieAgentHeader = `{"name":"junie:cli","version":"888.195"}`
+
+	anthropicAPIVersion = "2023-06-01"
 )
 
-// junieModelMapping maps client-facing model aliases to the real provider model names
-// accepted by the Ingrazzio /v1/chat/completions endpoint.
-// Derived from mitmproxy traffic captures of the Junie CLI (March 2026).
-// Models not listed here pass through unchanged.
+// --------------------------------------------------------------------------
+// Provider detection — determines which Ingrazzio endpoint to use.
+// --------------------------------------------------------------------------
+
+type junieUpstream string
+
+const (
+	upstreamOpenAI    junieUpstream = "openai"
+	upstreamAnthropic junieUpstream = "anthropic"
+)
+
+// junieUpstreamForModel returns the upstream provider for the given model name.
+// Both the client-facing alias and the mapped real name are checked.
+func junieUpstreamForModel(model string) junieUpstream {
+	lower := strings.ToLower(model)
+	if strings.HasPrefix(lower, "claude") {
+		return upstreamAnthropic
+	}
+	// Default: OpenAI endpoint (handles gpt-*, o1, o3, o4-mini, etc.)
+	return upstreamOpenAI
+}
+
+func junieEndpointForUpstream(up junieUpstream) string {
+	switch up {
+	case upstreamAnthropic:
+		return ingrazzioAnthropicEndpoint
+	default:
+		return ingrazzioOpenAIEndpoint
+	}
+}
+
+// --------------------------------------------------------------------------
+// Model name mapping: client-facing alias → real Ingrazzio model name.
+// --------------------------------------------------------------------------
+
 var junieModelMapping = map[string]string{
-	// OpenAI models — client alias -> real provider model name
-	"gpt4.1":              "gpt-4.1-2025-04-14",
-	"gpt4.1-mini":         "gpt-4.1-mini-2025-04-14",
-	"gpt4.1-nano":         "gpt-4.1-nano-2025-04-14",
-	"gpt-5":               "gpt-5-2025-08-07",
-	"gpt-5-mini":          "gpt-5-mini-2025-08-07",
-	"gpt-5-nano":          "gpt-5-nano-2025-08-07",
+	// OpenAI models
+	"gpt4.1":      "gpt-4.1-2025-04-14",
+	"gpt4.1-mini": "gpt-4.1-mini-2025-04-14",
+	"gpt4.1-nano": "gpt-4.1-nano-2025-04-14",
+	"gpt-5":       "gpt-5-2025-08-07",
+	"gpt-5-mini":  "gpt-5-mini-2025-08-07",
+	"gpt-5-nano":  "gpt-5-nano-2025-08-07",
+	"gpt-5.1":     "gpt-5.1-2025-11-13",
+	"gpt-5.2":     "gpt-5.2-2025-12-11",
+	"gpt-5.4":     "gpt-5.4-2026-03-05",
+	"o1":          "o1-2024-12-17",
+	"o3":          "o3-2025-04-16",
+	"o3-mini":     "o3-mini-2025-01-31",
+	"o4-mini":     "o4-mini-2025-04-16",
+	"gpt-4o":      "gpt-4o-2024-11-20",
+	"gpt-4o-mini": "gpt-4o-mini-2024-07-18",
 
 	// Anthropic models
 	"claude-4-sonnet":   "claude-sonnet-4-20250514",
@@ -51,7 +103,7 @@ var junieModelMapping = map[string]string{
 	"claude-4.6-sonnet": "claude-sonnet-4-6",
 	"claude-4.6-opus":   "claude-opus-4-6",
 
-	// Google Gemini models
+	// Gemini models (OpenAI endpoint may not accept — placeholder for future)
 	"gemini-flash-2.0":      "gemini-2.0-flash",
 	"gemini-flash-lite-2.0": "gemini-2.0-flash-lite",
 	"gemini-pro-2.5":        "gemini-2.5-pro",
@@ -59,8 +111,6 @@ var junieModelMapping = map[string]string{
 	"gemini-flash-lite-2.5": "gemini-2.5-flash-lite",
 }
 
-// mapJunieModelName returns the real provider model name for the given client-facing
-// model alias. If the name is not in the mapping it is returned unchanged.
 func mapJunieModelName(clientModel string) string {
 	if mapped, ok := junieModelMapping[clientModel]; ok {
 		return mapped
@@ -68,27 +118,27 @@ func mapJunieModelName(clientModel string) string {
 	return clientModel
 }
 
-// JunieExecutor is a stateless executor for the Junie (JetBrains Ingrazzio) provider.
-// Requests are forwarded directly to the Ingrazzio /v1/chat/completions endpoint in
-// OpenAI format — no format translation is needed. Only the model name is mapped from
-// the client-facing alias to the real provider name accepted by the endpoint.
+// --------------------------------------------------------------------------
+// JunieExecutor
+// --------------------------------------------------------------------------
+
+// JunieExecutor routes requests to the correct Ingrazzio per-provider endpoint.
+// OpenAI models → OpenAI endpoint (pass-through).
+// Anthropic models → Anthropic endpoint (OpenAI→Anthropic translation using existing translators).
 type JunieExecutor struct {
 	cfg *config.Config
 }
 
-// NewJunieExecutor constructs a new JunieExecutor.
 func NewJunieExecutor(cfg *config.Config) *JunieExecutor {
 	return &JunieExecutor{cfg: cfg}
 }
 
-// Identifier returns the provider key.
 func (e *JunieExecutor) Identifier() string { return "junie" }
 
-// junieCreds extracts the token from the auth record.
-// Priority order:
-//  1. Attributes["api_key"] - manually supplied JWT or API key
-//  2. Metadata["jwt_token"] - legacy JWT token from stored credentials
-//  3. Metadata["access_token"] - OAuth access token from JetBrains Account flow
+// --------------------------------------------------------------------------
+// Credentials
+// --------------------------------------------------------------------------
+
 func junieCreds(a *cliproxyauth.Auth) (jwtToken string) {
 	if a == nil {
 		return ""
@@ -104,7 +154,6 @@ func junieCreds(a *cliproxyauth.Auth) (jwtToken string) {
 				return trimmed
 			}
 		}
-		// OAuth access_token from JetBrains Account PKCE flow
 		if v, ok := a.Metadata["access_token"].(string); ok {
 			if trimmed := strings.TrimSpace(v); trimmed != "" {
 				return trimmed
@@ -114,7 +163,10 @@ func junieCreds(a *cliproxyauth.Auth) (jwtToken string) {
 	return ""
 }
 
-// PrepareRequest injects Junie credentials, Grazie-Agent, and User-Agent into the outgoing HTTP request.
+// --------------------------------------------------------------------------
+// PrepareRequest / HttpRequest (interface compliance)
+// --------------------------------------------------------------------------
+
 func (e *JunieExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
 		return nil
@@ -128,7 +180,6 @@ func (e *JunieExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	return nil
 }
 
-// HttpRequest injects Junie credentials into the request and executes it.
 func (e *JunieExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
 	if req == nil {
 		return nil, fmt.Errorf("junie executor: request is nil")
@@ -144,47 +195,149 @@ func (e *JunieExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return client.Do(httpReq)
 }
 
-// mapPayloadModel reads the model field from payload, maps it via mapJunieModelName,
-// and returns the updated payload. If the model is unchanged, the original payload is returned.
-func mapPayloadModel(payload []byte) []byte {
+// --------------------------------------------------------------------------
+// Payload helpers
+// --------------------------------------------------------------------------
+
+// mapPayloadModel maps the model field in the JSON payload and returns (updated payload, mapped model name).
+func mapPayloadModel(payload []byte) ([]byte, string) {
 	clientModel := gjson.GetBytes(payload, "model").String()
 	if clientModel == "" {
-		return payload
+		return payload, ""
 	}
 	mapped := mapJunieModelName(clientModel)
 	if mapped == clientModel {
-		return payload
+		return payload, mapped
 	}
 	updated, err := sjson.SetBytes(payload, "model", mapped)
 	if err != nil {
-		return payload
+		return payload, mapped
 	}
-	return updated
+	return updated, mapped
 }
 
-// Execute performs a non-streaming request to the Ingrazzio /v1/chat/completions endpoint.
-// The request is forwarded as-is (OpenAI format) after model name mapping.
-// The JSON response is returned directly without any translation.
+// translateOpenAIToAnthropic converts an OpenAI chat completion request body
+// into an Anthropic Messages API request body using the existing translator.
+func translateOpenAIToAnthropic(modelName string, payload []byte) []byte {
+	from := sdktranslator.FromString("openai")
+	to := sdktranslator.FromString("claude")
+	return sdktranslator.TranslateRequest(from, to, modelName, payload, false)
+}
+
+// anthropicResponseToOpenAI converts a native Anthropic Messages API JSON response
+// into an OpenAI chat.completion JSON response. This is a lightweight conversion that
+// handles the common case (text content, stop reason, usage) without needing the full
+// translator machinery (which expects specific request context).
+func anthropicResponseToOpenAI(responseBody []byte) []byte {
+	// Parse Anthropic response fields.
+	id := gjson.GetBytes(responseBody, "id").String()
+	model := gjson.GetBytes(responseBody, "model").String()
+	stopReason := gjson.GetBytes(responseBody, "stop_reason").String()
+
+	// Extract text content from Anthropic content blocks.
+	var textContent string
+	contents := gjson.GetBytes(responseBody, "content")
+	if contents.IsArray() {
+		for _, block := range contents.Array() {
+			if block.Get("type").String() == "text" {
+				textContent += block.Get("text").String()
+			}
+		}
+	}
+
+	// Map Anthropic stop_reason to OpenAI finish_reason.
+	finishReason := "stop"
+	switch stopReason {
+	case "end_turn", "stop_sequence":
+		finishReason = "stop"
+	case "max_tokens":
+		finishReason = "length"
+	case "tool_use":
+		finishReason = "tool_calls"
+	}
+
+	// Extract tool_calls if present.
+	var toolCallsJSON string
+	if contents.IsArray() {
+		var toolCalls []string
+		for _, block := range contents.Array() {
+			if block.Get("type").String() == "tool_use" {
+				tc := fmt.Sprintf(`{"id":%q,"type":"function","function":{"name":%q,"arguments":%s}}`,
+					block.Get("id").String(),
+					block.Get("name").String(),
+					block.Get("input").Raw)
+				toolCalls = append(toolCalls, tc)
+			}
+		}
+		if len(toolCalls) > 0 {
+			toolCallsJSON = `,"tool_calls":[` + strings.Join(toolCalls, ",") + `]`
+		}
+	}
+
+	// Build usage.
+	inputTokens := gjson.GetBytes(responseBody, "usage.input_tokens").Int()
+	outputTokens := gjson.GetBytes(responseBody, "usage.output_tokens").Int()
+
+	// Build OpenAI response.
+	out := fmt.Sprintf(`{"id":%q,"object":"chat.completion","created":%d,"model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":%q%s},"finish_reason":%q}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
+		id, time.Now().Unix(), model,
+		textContent, toolCallsJSON,
+		finishReason,
+		inputTokens, outputTokens, inputTokens+outputTokens)
+	return []byte(out)
+}
+
+// translateAnthropicToOpenAIStream converts an Anthropic SSE streaming chunk
+// into OpenAI SSE format using the existing translator.
+func translateAnthropicToOpenAIStream(ctx context.Context, modelName string, originalReq, translatedReq, chunk []byte, param *any) []string {
+	from := sdktranslator.FromString("claude")
+	to := sdktranslator.FromString("openai")
+	return sdktranslator.TranslateStream(ctx, from, to, modelName, originalReq, translatedReq, chunk, param)
+}
+
+// setJunieHeaders sets all required headers for an Ingrazzio request.
+func setJunieHeaders(req *http.Request, jwtToken string, upstream junieUpstream) {
+	req.Header.Set("Authorization", "Bearer "+jwtToken)
+	req.Header.Set("User-Agent", grazieUserAgent)
+	req.Header.Set("Grazie-Agent", grazieAgentHeader)
+	req.Header.Set("Content-Type", "application/json")
+	if upstream == upstreamAnthropic {
+		req.Header.Set("anthropic-version", anthropicAPIVersion)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Execute (non-streaming)
+// --------------------------------------------------------------------------
+
 func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	jwtToken := junieCreds(auth)
 	if strings.TrimSpace(jwtToken) == "" {
 		return resp, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	// Apply model name mapping to the payload.
-	body := mapPayloadModel(req.Payload)
+	// Map model name and determine upstream provider.
+	body, mappedModel := mapPayloadModel(req.Payload)
+	if mappedModel == "" {
+		mappedModel = gjson.GetBytes(body, "model").String()
+	}
+	upstream := junieUpstreamForModel(mappedModel)
+	endpoint := junieEndpointForUpstream(upstream)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
+	// For Anthropic upstream: translate OpenAI → Anthropic format.
+	if upstream == upstreamAnthropic {
+		body = translateOpenAIToAnthropic(mappedModel, body)
+		body, _ = sjson.SetBytes(body, "model", mappedModel)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return resp, fmt.Errorf("junie executor: build request: %w", err)
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+jwtToken)
-	httpReq.Header.Set("User-Agent", grazieUserAgent)
-	httpReq.Header.Set("Grazie-Agent", grazieAgentHeader)
-	httpReq.Header.Set("Content-Type", "application/json")
+	setJunieHeaders(httpReq, jwtToken, upstream)
 
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:      ingrazzioEndpoint,
+		URL:      endpoint,
 		Method:   http.MethodPost,
 		Headers:  httpReq.Header.Clone(),
 		Body:     body,
@@ -217,34 +370,55 @@ func (e *JunieExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
 	}
 
-	// Return the OpenAI-format JSON response directly — no translation needed.
+	// For Anthropic upstream: translate response back to OpenAI format.
+	if upstream == upstreamAnthropic {
+		data = anthropicResponseToOpenAI(data)
+	}
+
 	resp = cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
 
-// ExecuteStream performs a streaming request to the Ingrazzio /v1/chat/completions endpoint.
-// SSE lines are piped directly to the output channel — no translation is needed since
-// Ingrazzio returns native OpenAI SSE format.
+// --------------------------------------------------------------------------
+// ExecuteStream (streaming)
+// --------------------------------------------------------------------------
+
 func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	jwtToken := junieCreds(auth)
 	if strings.TrimSpace(jwtToken) == "" {
 		return nil, fmt.Errorf("junie executor: missing JWT token")
 	}
 
-	// Apply model name mapping to the payload.
-	body := mapPayloadModel(req.Payload)
+	// Map model name and determine upstream provider.
+	body, mappedModel := mapPayloadModel(req.Payload)
+	if mappedModel == "" {
+		mappedModel = gjson.GetBytes(body, "model").String()
+	}
+	upstream := junieUpstreamForModel(mappedModel)
+	endpoint := junieEndpointForUpstream(upstream)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ingrazzioEndpoint, bytes.NewReader(body))
+	// For Anthropic upstream: translate OpenAI → Anthropic format, force stream=true.
+	originalPayload := body
+	var translatedPayload []byte
+	if upstream == upstreamAnthropic {
+		body = translateOpenAIToAnthropic(mappedModel, body)
+		body, _ = sjson.SetBytes(body, "model", mappedModel)
+		body, _ = sjson.SetBytes(body, "stream", true)
+		translatedPayload = body
+	} else {
+		// Ensure stream=true for OpenAI endpoint.
+		body, _ = sjson.SetBytes(body, "stream", true)
+		translatedPayload = body
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("junie executor: build request: %w", err)
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+jwtToken)
-	httpReq.Header.Set("User-Agent", grazieUserAgent)
-	httpReq.Header.Set("Grazie-Agent", grazieAgentHeader)
-	httpReq.Header.Set("Content-Type", "application/json")
+	setJunieHeaders(httpReq, jwtToken, upstream)
 
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:      ingrazzioEndpoint,
+		URL:      endpoint,
 		Method:   http.MethodPost,
 		Headers:  httpReq.Header.Clone(),
 		Body:     body,
@@ -279,16 +453,28 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 
+		var param any
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
 
-			// Pass through non-empty SSE lines directly — Ingrazzio returns native
-			// OpenAI SSE format so no translation is required.
 			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) > 0 {
+			if len(trimmed) == 0 {
+				continue
+			}
+
+			if upstream == upstreamAnthropic {
+				// Translate Anthropic SSE → OpenAI SSE format.
+				translated := translateAnthropicToOpenAIStream(ctx, mappedModel, originalPayload, translatedPayload, line, &param)
+				for _, chunk := range translated {
+					if strings.TrimSpace(chunk) != "" {
+						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk)}
+					}
+				}
+			} else {
+				// OpenAI upstream: pass-through.
 				out <- cliproxyexecutor.StreamChunk{Payload: bytes.Clone(line)}
 			}
 		}
@@ -301,16 +487,15 @@ func (e *JunieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
-// Refresh attempts to refresh the Junie auth tokens.
-// For OAuth PKCE mode: uses the refresh_token from auth.Metadata to obtain new tokens.
-// For legacy JWT manual mode (no refresh_token in metadata): returns auth unchanged.
-// Nil auth is returned as-is without error.
+// --------------------------------------------------------------------------
+// Refresh (OAuth token refresh)
+// --------------------------------------------------------------------------
+
 func (e *JunieExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
 
-	// Check for OAuth refresh token in metadata
 	var refreshToken string
 	if auth.Metadata != nil {
 		if v, ok := auth.Metadata["refresh_token"].(string); ok {
@@ -319,18 +504,15 @@ func (e *JunieExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	}
 
 	if refreshToken == "" {
-		// No refresh token available - legacy JWT manual mode, return as-is
 		log.Warnf("junie executor: no refresh_token in metadata; JWT tokens must be manually refreshed")
 		return auth, nil
 	}
 
-	// OAuth mode: exchange refresh token for new tokens
 	tokenData, err := junieauth.NewJunieAuth(e.cfg).RefreshTokens(ctx, refreshToken)
 	if err != nil {
 		return nil, fmt.Errorf("junie executor: token refresh failed: %w", err)
 	}
 
-	// Update metadata with new token values
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -349,7 +531,10 @@ func (e *JunieExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return auth, nil
 }
 
-// CountTokens is not supported for the Junie provider.
+// --------------------------------------------------------------------------
+// CountTokens (not supported)
+// --------------------------------------------------------------------------
+
 func (e *JunieExecutor) CountTokens(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, fmt.Errorf("junie executor: CountTokens not supported")
 }
