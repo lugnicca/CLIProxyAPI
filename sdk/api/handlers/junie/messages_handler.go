@@ -396,12 +396,28 @@ func anthropicToOpenAIRequest(body []byte, model string) []byte {
 	if tools.Exists() && tools.IsArray() {
 		var openaiTools []map[string]any
 		tools.ForEach(func(_, tool gjson.Result) bool {
+			// Get input_schema and ensure it has required fields for OpenAI
+			schema := tool.Get("input_schema")
+			var params map[string]any
+			if schema.Exists() && schema.Type == gjson.JSON {
+				params, _ = schema.Value().(map[string]any)
+			}
+			if params == nil {
+				params = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			// OpenAI requires "properties" in object schemas
+			if params["type"] == "object" || params["type"] == nil {
+				params["type"] = "object"
+				if params["properties"] == nil {
+					params["properties"] = map[string]any{}
+				}
+			}
 			openaiTools = append(openaiTools, map[string]any{
 				"type": "function",
 				"function": map[string]any{
 					"name":        tool.Get("name").String(),
 					"description": tool.Get("description").String(),
-					"parameters":  tool.Get("input_schema").Value(),
+					"parameters":  params,
 				},
 			})
 			return true
