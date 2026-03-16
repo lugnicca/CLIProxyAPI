@@ -63,6 +63,15 @@ func isClaudeModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(model), "claude")
 }
 
+func isReasoningModel(model string) bool {
+	lower := strings.ToLower(model)
+	// GPT-5+ and o-series are reasoning models that use tokens for chain-of-thought
+	return strings.HasPrefix(lower, "gpt-5") ||
+		strings.HasPrefix(lower, "o1") ||
+		strings.HasPrefix(lower, "o3") ||
+		strings.HasPrefix(lower, "o4")
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -374,15 +383,28 @@ func anthropicToOpenAIRequest(body []byte, model string) []byte {
 		"messages": messages,
 	}
 
-	// Map max_tokens → max_completion_tokens for newer models
+	// Map max_tokens → max_completion_tokens for newer models.
+	// Reasoning models (gpt-5, o3, o4) use tokens for internal reasoning PLUS the
+	// visible response. If the caller sends a small max_tokens (e.g. 1024), the model
+	// may spend it all on reasoning and return empty content. We enforce a minimum
+	// to ensure there's room for both reasoning and a visible response.
 	if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() {
-		result["max_completion_tokens"] = mt.Int()
+		tokens := mt.Int()
+		if isReasoningModel(model) && tokens < 8192 {
+			tokens = 8192
+		}
+		result["max_completion_tokens"] = tokens
+	} else if isReasoningModel(model) {
+		result["max_completion_tokens"] = 8192
 	}
-	if temp := gjson.GetBytes(body, "temperature"); temp.Exists() {
-		result["temperature"] = temp.Float()
-	}
-	if topP := gjson.GetBytes(body, "top_p"); topP.Exists() {
-		result["top_p"] = topP.Float()
+	// Reasoning models don't support temperature/top_p
+	if !isReasoningModel(model) {
+		if temp := gjson.GetBytes(body, "temperature"); temp.Exists() {
+			result["temperature"] = temp.Float()
+		}
+		if topP := gjson.GetBytes(body, "top_p"); topP.Exists() {
+			result["top_p"] = topP.Float()
+		}
 	}
 
 	// OpenAI requires stream_options when streaming
