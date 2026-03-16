@@ -276,30 +276,37 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 		return
 	}
 
-	// Stream: translate each OpenAI SSE chunk → Anthropic SSE chunk
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Status(http.StatusOK)
+	// Stream: translate each OpenAI SSE chunk → Anthropic SSE events.
+	// We write raw bytes to the ResponseWriter to match Anthropic's exact SSE format.
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.WriteHeaderNow()
+	c.Writer.Status()
 
-	flusher, _ := c.Writer.(http.Flusher)
+	flush := func() {
+		if f, ok := c.Writer.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
+	writeEvent := func(event, data string) {
+		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, data)
+		flush()
+	}
 
 	// Send Anthropic message_start event
 	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
-	fmt.Fprintf(c.Writer, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":%q,\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":%q,\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n", msgID, model)
-	if flusher != nil {
-		flusher.Flush()
-	}
+	writeEvent("message_start", fmt.Sprintf(
+		`{"type":"message_start","message":{"id":%q,"type":"message","role":"assistant","content":[],"model":%q,"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`,
+		msgID, model))
 
 	// Send content_block_start
-	fmt.Fprintf(c.Writer, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
+	writeEvent("content_block_start",
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(nil, 52_428_800)
-	var totalContent string
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -311,34 +318,28 @@ func (h *JunieMessagesHandler) translateAndProxyOpenAIStream(c *gin.Context, ant
 		}
 
 		// Extract content delta from OpenAI chunk
-		delta := gjson.Get(payload, "choices.0.delta.content").String()
-		if delta != "" {
-			totalContent += delta
-			// Emit Anthropic content_block_delta
-			escaped, _ := sjson.Set("{}", "x", delta)
-			deltaJSON := gjson.Get(escaped, "x").Raw // properly escaped string
-			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":%s}}\n\n", deltaJSON)
-			if flusher != nil {
-				flusher.Flush()
-			}
+		delta := gjson.Get(payload, "choices.0.delta.content")
+		if delta.Exists() && delta.String() != "" {
+			// Use the raw JSON string value to preserve escaping
+			writeEvent("content_block_delta", fmt.Sprintf(
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`,
+				delta.Raw))
 		}
 
 		// Check for finish
-		finishReason := gjson.Get(payload, "choices.0.finish_reason").String()
-		if finishReason != "" && finishReason != "null" {
+		finishReason := gjson.Get(payload, "choices.0.finish_reason")
+		if finishReason.Exists() && finishReason.String() != "" && finishReason.Type != gjson.Null {
 			break
 		}
 	}
 
 	// Send content_block_stop
-	fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+	writeEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
 	// Send message_delta with stop_reason
-	fmt.Fprintf(c.Writer, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n")
+	writeEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}`)
 	// Send message_stop
-	fmt.Fprintf(c.Writer, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
+	writeEvent("message_stop", `{"type":"message_stop"}`)
+	flush()
 }
 
 // ---------------------------------------------------------------------------
